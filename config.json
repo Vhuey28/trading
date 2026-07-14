@@ -1,0 +1,53 @@
+{
+  "symbols": [
+    "QQQ",
+    "SPY",
+    "IWM",
+    "SCHD",
+    "BND"
+  ],
+
+  "timezone": "America/Los_Angeles",
+  "trade_window_start": "06:00",
+  "trade_window_end": "01:00",
+
+  "paper": true,
+  "dry_run": true,
+
+  "notional_usd": 25.0,
+
+  "poll_seconds": 60,
+
+  "timeframe": "1Min",
+
+  "stock_feed": "iex",
+  "stock_adjustment": "split",
+
+  "extended_hours": true,
+
+  "limit_price_offset_pct": 0.002,
+
+  "data_dir": "data",
+  "log_dir": "logs",
+  "state_file": "state/trend_bot_state.json",
+
+  "max_daily_trades": 6,
+  "min_minutes_between_trades": 30,
+
+  "fast_sma_period": 20,
+  "slow_sma_period": 50,
+
+  "lookback_minutes": 180,
+
+  "breakout_buffer_pct": 0.0015,
+
+  "stop_loss_pct": 0.02,
+  "take_profit_pct": 0.04,
+  "trail_stop_pct": 0.015,
+
+  "exit_when_window_closes": true,
+
+  "require_previous_day_uptrend": true,
+  "log_strategy_details": true,
+  "minimum_volume_multiplier": 1.25
+}

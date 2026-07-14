@@ -1,0 +1,8 @@
+.env
+config.local.json
+data/*.csv
+logs/*.log
+state/*.json
+__pycache__/
+*.pyc
+
