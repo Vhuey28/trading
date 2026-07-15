@@ -1,3 +1,4 @@
+
 """
 backtest.py — Trend-bot backtester
 ====================================
@@ -46,7 +47,7 @@ def symbol_file_stem(symbol: str) -> str:
 
 
 def _weekdays_in_range(start: date, end: date) -> list[date]:
-    """Return every Mon–Fri between start (inclusive) and end (inclusive)."""
+    #Return every Mon–Fri between start (inclusive) and end (inclusive).
     days: list[date] = []
     cur = start
     while cur <= end:
@@ -100,7 +101,7 @@ def fetch_and_cache(
     symbol: str, day: date, config: BotConfig,
     data_dir: Path, logger: logging.Logger,
 ) -> list[Bar]:
-    """Download bars for *symbol* on *day* from Alpaca and cache to CSV."""
+    #Download bars for *symbol* on *day* from Alpaca and cache to CSV.
     from alpaca_client import AlpacaClient
     from zoneinfo import ZoneInfo
 
@@ -127,7 +128,7 @@ def _load_day(
     symbol: str, day: date, config: BotConfig,
     data_dir: Path, logger: logging.Logger, fetch_missing: bool,
 ) -> list[Bar] | None:
-    """Load (optionally fetch) bars for one symbol/day. Returns None on miss."""
+    #Load (optionally fetch) bars for one symbol/day. Returns None on miss.
     path = data_dir / f"{symbol_file_stem(symbol)}_{day.isoformat()}_{config.timeframe}.csv"
     if not path.exists():
         if fetch_missing:
@@ -430,3 +431,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
