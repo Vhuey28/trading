@@ -94,7 +94,22 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(levels.low, 99.0)
 
     def test_buy_signal_requires_breakout_and_ma_alignment(self) -> None:
-        config = BotConfig(fast_sma_period=3, slow_sma_period=5, breakout_buffer_pct=0.0)
+        config = BotConfig(
+            fast_sma_period=3,
+            slow_sma_period=5,
+            breakout_buffer_pct=0.0,
+            use_breakout_entry=True,
+            use_atr_breakout=False,
+            use_pullback_entry=False,
+            use_vwap_continuation_entry=False,
+            use_multi_timeframe=False,
+            require_previous_day_uptrend=True,
+            use_adaptive_volume=False,
+            minimum_volume_multiplier=0.0,
+            volume_period=3,
+            atr_period=3,
+            rsi_period=3,
+        )
         previous = compute_previous_day_levels(date(2026, 7, 1), self.make_bars([100, 101, 102, 103, 104]))
         recent = self.make_bars([103, 104, 105, 106, 107])
         signal = build_signal(previous, recent, {}, config)
@@ -102,7 +117,12 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.action, "buy")
 
     def test_sell_signal_on_stop_loss(self) -> None:
-        config = BotConfig(fast_sma_period=3, slow_sma_period=5, stop_loss_pct=0.02)
+        config = BotConfig(
+            fast_sma_period=3,
+            slow_sma_period=5,
+            stop_loss_pct=0.02,
+            use_atr_stops=False,
+        )
         previous = compute_previous_day_levels(date(2026, 7, 1), self.make_bars([100, 101, 102, 103, 104]))
         state = {"in_position": True, "entry_price": 100.0, "highest_price_since_entry": 105.0}
         recent = self.make_bars([102, 101, 100, 99, 97])

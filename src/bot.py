@@ -39,9 +39,35 @@ class TrendBot:
         self.previous_levels_requested_day: dict[str, date] = {}
         self.last_notification_hour: int | None = None
 
+        # CSV trade export
+        self.trades_csv_path = self.resolve_path(config.trades_csv_path)
+        if config.export_trades_csv:
+            self._init_trades_csv()
+
+        # Warn if using IEX feed with extended hours (IEX doesn't provide extended hours data)
+        if config.extended_hours and getattr(config, "stock_feed", "iex") == "iex":
+            self.logger.warning(
+                "Config has extended_hours=true but stock_feed='iex'. "
+                "IEX feed does NOT include extended hours data (pre-market/after-hours). "
+                "Consider using stock_feed='sip' (requires subscription) or set extended_hours=false."
+            )
+
     def resolve_path(self, value: str) -> Path:
         path = Path(value)
         return path if path.is_absolute() else self.root_dir / path
+
+    def _init_trades_csv(self) -> None:
+        """Initialize trades CSV with headers if it doesn't exist"""
+        if not self.trades_csv_path.exists():
+            self.trades_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.trades_csv_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "symbol", "action", "price", "reason",
+                    "entry_price", "exit_price", "pnl", "pnl_pct", "notional",
+                    "fast_sma", "slow_sma", "rsi", "atr", "volume_ratio",
+                    "session_vwap", "breakout_price"
+                ])
 
     def load_state(self) -> dict[str, Any]:
         if not self.state_file.exists():
@@ -73,6 +99,12 @@ class TrendBot:
         return "/" not in symbol
 
     def _fetch_bars(self, symbol: str, start: datetime, end: datetime, timeframe: str) -> list[Bar]:
+        if self._uses_stock_endpoint(symbol):
+            return self.client.fetch_stock_bars(symbol, start, end, timeframe)
+        return self.client.fetch_crypto_bars(symbol, start, end, timeframe)
+
+    def _fetch_bars_with_timeframe(self, symbol: str, start: datetime, end: datetime, timeframe: str) -> list[Bar]:
+        """Fetch bars with a specific timeframe (overrides config.timeframe)"""
         if self._uses_stock_endpoint(symbol):
             return self.client.fetch_stock_bars(symbol, start, end, timeframe)
         return self.client.fetch_crypto_bars(symbol, start, end, timeframe)
@@ -232,7 +264,50 @@ class TrendBot:
             end=end,
             timeframe=self.config.timeframe,
         )
+        self.logger.debug(
+            "[%s] fetch_recent_bars: requested %d minutes (%s to %s UTC), got %d bars (timeframe=%s)",
+            symbol,
+            self.config.lookback_minutes,
+            start.isoformat(),
+            end.isoformat(),
+            len(bars),
+            self.config.timeframe,
+        )
+
+        # Track the last successful fetch time to distinguish "no new bar yet" from failures
+        state_key = "_last_successful_bars"
+        state = getattr(self, state_key, {})
+        last_bars = state.get(symbol, [])
+        last_fetch_time = state.get(f"{symbol}_time")
+
+        # If we got no new bars but had previous bars, check if enough time passed
+        # for a new bar to form (based on timeframe). If not, reuse cached bars.
+        if not bars and last_bars:
+            timeframe_seconds = self._timeframe_to_seconds(self.config.timeframe)
+            if last_fetch_time:
+                time_since_last = (now - last_fetch_time).total_seconds()
+                if time_since_last < timeframe_seconds * 0.8:
+                    self.logger.debug(
+                        "[%s] No new bars yet (%.1fs since last fetch, timeframe=%ds); reusing %d cached bars",
+                        symbol,
+                        time_since_last,
+                        timeframe_seconds,
+                        len(last_bars),
+                    )
+                    return last_bars
+                self.logger.debug(
+                    "[%s] Sufficient time passed (%.1fs) for new %s bar but API returned 0 bars",
+                    symbol,
+                    time_since_last,
+                    self.config.timeframe,
+                )
+
         if len(bars) >= self.config.slow_sma_period:
+            # Update cache on successful fetch
+            if not hasattr(self, state_key):
+                setattr(self, state_key, {})
+            getattr(self, state_key)[symbol] = bars
+            getattr(self, state_key)[f"{symbol}_time"] = now
             return bars
 
         # Outside market hours or insufficient live data — fall back to the
@@ -253,8 +328,72 @@ class TrendBot:
                 )
                 return cached
 
+        # If we have some cached bars (even if less than slow_sma_period), use them
+        if last_bars:
+            self.logger.warning(
+                "[%s] Live bars insufficient (%d bars); using %d previously cached bars as fallback",
+                symbol,
+                len(bars),
+                len(last_bars),
+            )
+            return last_bars
+
         # Return whatever we have (possibly empty — caller handles it)
+        if not bars:
+            self.logger.warning(
+                "[%s] Live bars insufficient (%d bars); no cached fallback available with enough data",
+                symbol,
+                len(bars),
+            )
         return bars
+
+    def _timeframe_to_seconds(self, timeframe: str) -> int:
+        """Convert timeframe string (e.g., '1Min', '5Min', '1Hour') to seconds."""
+        timeframe = timeframe.lower().strip()
+        if timeframe.endswith("min"):
+            return int(timeframe[:-3]) * 60
+        if timeframe.endswith("hour") or timeframe.endswith("h"):
+            return int(timeframe[:-4]) * 3600 if timeframe.endswith("hour") else int(timeframe[:-1]) * 3600
+        if timeframe.endswith("day") or timeframe.endswith("d"):
+            return int(timeframe[:-3]) * 86400 if timeframe.endswith("day") else int(timeframe[:-1]) * 86400
+        return 60  # default to 1 minute
+
+    def fetch_trend_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        """Fetch higher timeframe bars for multi-timeframe trend confirmation"""
+        if not self.config.use_multi_timeframe:
+            return []
+
+        end = now.astimezone(timezone.utc)
+        # Need enough bars for trend_sma_period (default 50)
+        lookback = max(self.config.trend_sma_period * 5, self.config.lookback_minutes * 5)
+        start = end - timedelta(minutes=lookback)
+
+        self.logger.debug(
+            "[%s] fetch_trend_bars: requested lookback=%d min (%s to %s UTC), timeframe=%s",
+            symbol,
+            lookback,
+            start.isoformat(),
+            end.isoformat(),
+            self.config.trend_timeframe,
+        )
+
+        try:
+            bars = self._fetch_bars_with_timeframe(
+                symbol,
+                start=start,
+                end=end,
+                timeframe=self.config.trend_timeframe,
+            )
+            self.logger.debug(
+                "[%s] fetch_trend_bars: got %d bars (timeframe=%s)",
+                symbol,
+                len(bars),
+                self.config.trend_timeframe,
+            )
+            return bars
+        except Exception as e:
+            self.logger.warning("[%s] Failed to fetch trend bars (%s): %s", symbol, self.config.trend_timeframe, e)
+            return []
 
     def sync_live_position(self, symbol: str, symbol_state: dict[str, Any]) -> None:
         if self.config.dry_run:
@@ -273,7 +412,7 @@ class TrendBot:
             state["trade_count"] = 0
         if int(state.get("trade_count", 0)) >= self.config.max_daily_trades:
             return False
-        
+
         symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
         last_trade_at = symbol_state.get("last_trade_at")
         if not last_trade_at:
@@ -286,7 +425,7 @@ class TrendBot:
         now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         state["last_trade_at"] = now_str
         state["trade_count"] = int(state.get("trade_count", 0)) + 1
-        
+
         symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
         symbol_state["last_trade_at"] = now_str
         symbol_state["last_signal_reason"] = signal.reason
@@ -300,9 +439,49 @@ class TrendBot:
             symbol_state["entry_price"] = None
             symbol_state["highest_price_since_entry"] = None
 
-    def execute_signal(self, symbol: str, signal: TradeSignal, state: dict[str, Any]) -> None:
+    def export_trade_to_csv(
+        self,
+        symbol: str,
+        signal: TradeSignal,
+        order: dict[str, Any] | None,
+        entry_price: float | None,
+        exit_price: float | None,
+        pnl: float | None,
+        pnl_pct: float | None,
+        indicators: dict[str, Any]
+    ) -> None:
+        """Export trade to CSV for analysis"""
+        if not self.config.export_trades_csv:
+            return
+
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self.trades_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now,
+                symbol,
+                signal.action,
+                signal.price,
+                signal.reason,
+                entry_price if entry_price is not None else "",
+                exit_price if exit_price is not None else "",
+                pnl if pnl is not None else "",
+                pnl_pct if pnl_pct is not None else "",
+                self.config.notional_usd,
+                indicators.get("fast_sma", ""),
+                indicators.get("slow_sma", ""),
+                indicators.get("rsi", ""),
+                indicators.get("atr", ""),
+                indicators.get("volume_ratio", ""),
+                indicators.get("session_vwap", ""),
+                indicators.get("breakout_price", ""),
+            ])
+
+    def execute_signal(self, symbol: str, signal: TradeSignal, state: dict[str, Any], indicators: dict[str, Any] | None = None) -> None:
         if signal.action == "buy" and not self.can_trade_now(state, symbol, datetime.now(self.tz)):
             self.logger.info("[%s] Signal skipped because trade limits are active: %s", symbol, signal.reason)
+            if self.config.log_skipped_signals:
+                self.logger.info("[%s] SKIPPED BUY: %s (trade limits)", symbol, signal.reason)
             return
 
         if self.config.dry_run:
@@ -314,16 +493,46 @@ class TrendBot:
                 signal.reason,
             )
             self.record_trade(state, symbol, signal, None)
+            # Export dry run trades too for analysis
+            if self.config.export_trades_csv and indicators:
+                self.export_trade_to_csv(
+                    symbol, signal, None,
+                    signal.price if signal.action == "buy" else None,
+                    signal.price if signal.action == "sell" else None,
+                    None, None, indicators
+                )
             return
+
+        entry_price = None
+        exit_price = None
+        pnl = None
+        pnl_pct = None
 
         if signal.action == "buy":
             order = self.client.place_market_buy(symbol, self.config.notional_usd)
+            entry_price = signal.price
         elif signal.action == "sell":
             order = self.client.close_position(symbol)
+            exit_price = signal.price
+            # Calculate P&L if we have entry price
+            symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
+            if symbol_state.get("entry_price"):
+                entry = symbol_state["entry_price"]
+                qty = self.config.notional_usd / entry
+                pnl = (exit_price - entry) * qty
+                pnl_pct = (exit_price / entry - 1.0) * 100.0
         else:
             order = None
+
         self.logger.info("[%s] Placed %s order: %s", symbol, signal.action, order)
         self.record_trade(state, symbol, signal, order)
+
+        # Export trade to CSV
+        if self.config.export_trades_csv and indicators:
+            self.export_trade_to_csv(
+                symbol, signal, order,
+                entry_price, exit_price, pnl, pnl_pct, indicators
+            )
 
     def run_once(self, now: datetime | None = None) -> None:
         now = now or datetime.now(self.tz)
@@ -340,6 +549,20 @@ class TrendBot:
             self.config.trade_window_start,
             self.config.trade_window_end,
         )
+
+        # Check market clock from Alpaca to know if market is actually open
+        # (includes extended hours if configured)
+        if self.config.extended_hours:
+            market_open = self.client.is_market_open_extended()
+        else:
+            market_open = self.client.is_market_open()
+        self.logger.debug(
+            "Market clock check: window_open=%s, market_open=%s, now=%s",
+            window_open,
+            market_open,
+            now.isoformat(),
+        )
+
         if not window_open:
             exited_any = False
             for symbol in self.config.symbols:
@@ -349,12 +572,26 @@ class TrendBot:
                     signal = TradeSignal("sell", "configured trading window is closed", float(symbol_state["entry_price"]))
                     self.execute_signal(symbol, signal, state)
                     exited_any = True
-            
+
             if not exited_any:
                 self.logger.info("Outside trading window; no trade check.")
             self._send_hourly_notification(now, "Trend bot is alive but outside trading hours.")
             self.save_state(state)
             return
+
+        # If market is closed (e.g., weekend/holiday) but our window is open,
+        # log a clear message and skip trading to avoid using stale data
+        if not market_open:
+            self.logger.warning(
+                "Trading window is open but market is CLOSED (weekend/holiday). Skipping trade checks to avoid stale data."
+            )
+            self._send_hourly_notification(now, "Market closed (weekend/holiday); bot waiting.")
+            self.save_state(state)
+            return
+
+        # Cache for storing previous bars to handle "no new bar yet" scenarios
+        if not hasattr(self, "_bar_cache"):
+            self._bar_cache = {}
 
         for symbol in self.config.symbols:
             symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
@@ -367,34 +604,93 @@ class TrendBot:
                 continue
 
             recent_bars = self.fetch_recent_bars(symbol, now)
+
+            # If no live bars returned, try to use cached bars from previous successful fetch
             if not recent_bars:
-                self.logger.info("[%s] No recent bars fetched", symbol)
+                self.logger.warning("[%s] No live bars returned; checking cache...", symbol)
+                cached_bars = self._bar_cache.get(symbol)
+                if cached_bars:
+                    self.logger.info(
+                        "[%s] Using %d cached bars from previous successful fetch (timestamp: %s)",
+                        symbol,
+                        len(cached_bars),
+                        cached_bars[-1].timestamp.isoformat() if cached_bars else "N/A",
+                    )
+                    recent_bars = cached_bars
+                else:
+                    self.logger.warning("[%s] No cached bars available either; skipping this cycle", symbol)
+                    continue
+            else:
+                # Update cache with successful fetch
+                self._bar_cache[symbol] = recent_bars
+
+            if not recent_bars:
+                self.logger.warning("[%s] No bars available (live or cached); skipping", symbol)
                 continue
 
-            # compute indicators for logging
+            # Fetch trend timeframe bars for multi-timeframe confirmation
+            trend_bars = []
+            if self.config.use_multi_timeframe:
+                trend_bars = self.fetch_trend_bars(symbol, now)
+
+            # compute indicators for logging and strategy
             ordered = sorted(recent_bars, key=lambda bar: bar.timestamp)
             closes = [bar.close for bar in ordered]
             price = closes[-1] if closes else None
-            from indicators import sma, atr, rsi, avg_volume
+            from indicators import sma, atr, rsi, avg_volume, vwap
 
             fast = sma(closes, self.config.fast_sma_period)
             slow = sma(closes, self.config.slow_sma_period)
-            atr_val = atr(ordered)
-            rsi_val = rsi(closes)
-            avg_vol = avg_volume(ordered)
+            atr_val = atr(ordered, self.config.atr_period)
+            rsi_val = rsi(closes, self.config.rsi_period)
+            avg_vol = avg_volume(ordered, self.config.volume_period)
             vol_ratio = None
             last_vol = ordered[-1].volume if ordered else None
             if avg_vol and last_vol is not None and avg_vol > 0:
                 vol_ratio = last_vol / avg_vol
 
+            session_vwap = vwap(ordered)
+
             breakout_price = levels.high * (1.0 + self.config.breakout_buffer_pct)
+            atr_breakout_price = None
+            if self.config.use_atr_breakout and atr_val is not None:
+                atr_breakout_price = levels.high - (self.config.atr_breakout_buffer * atr_val)
+
+            # Check individual conditions for detailed logging
+            current_time = ordered[-1].timestamp
+            market_time_str = current_time.strftime("%H:%M")
+            is_pre_market = market_time_str < "10:30"
+
+            # Volume check
+            if self.config.use_adaptive_volume and vol_ratio is not None:
+                if is_pre_market:
+                    volume_ok = vol_ratio >= self.config.volume_ratio_pre_market
+                else:
+                    volume_ok = vol_ratio >= self.config.volume_ratio_regular_hours
+            else:
+                volume_ok = vol_ratio is not None and vol_ratio > self.config.minimum_volume_multiplier
+
+            # Multi-timeframe check
+            mtf_ok = True
+            if self.config.use_multi_timeframe and trend_bars:
+                from indicators import compute_multi_timeframe_trend
+                mtf = compute_multi_timeframe_trend(
+                    trend_bars, ordered,
+                    self.config.trend_sma_period,
+                    self.config.fast_sma_period,
+                    self.config.slow_sma_period
+                )
+                mtf_ok = mtf.get("trend_up", True)
 
             checks = {
                 "Trend Up": levels.trend == "up",
                 "Fast SMA > Slow SMA": (fast is not None and slow is not None and fast > slow),
+                "Price > Fast SMA": (price is not None and fast is not None and price > fast),
                 "Breakout": (price is not None and price >= breakout_price),
-                "Volume": (vol_ratio is not None and vol_ratio > 1.5),
+                "ATR Breakout": (price is not None and atr_breakout_price is not None and price > atr_breakout_price),
+                "Volume": volume_ok,
                 "RSI": (rsi_val is not None and 40 <= rsi_val <= 70),
+                "MTF Trend": mtf_ok,
             }
 
             # formatted block log
@@ -408,19 +704,40 @@ class TrendBot:
             lines.append(f"ATR              {atr_val:.2f}" if atr_val is not None else "ATR              n/a")
             lines.append(f"RSI              {rsi_val:.1f}" if rsi_val is not None else "RSI              n/a")
             lines.append(f"Volume Ratio     {vol_ratio:.2f}" if vol_ratio is not None else "Volume Ratio     n/a")
+            lines.append(f"Session VWAP     {session_vwap:.2f}" if session_vwap is not None else "Session VWAP     n/a")
             lines.append(f"Breakout         {breakout_price:.2f}")
+            if atr_breakout_price is not None:
+                lines.append(f"ATR Breakout     {atr_breakout_price:.2f}")
             lines.append("")
             for name, ok in checks.items():
                 lines.append(("✓ " if ok else "✗ ") + name)
             lines.append("")
 
-            signal = build_signal(levels, recent_bars, symbol_state, self.config)
+            # Build signal with trend_bars for multi-timeframe
+            # We'll pass trend_bars through state temporarily
+            symbol_state_with_mtf = dict(symbol_state)
+            symbol_state_with_mtf["_trend_bars"] = trend_bars
+            signal = build_signal(levels, recent_bars, symbol_state_with_mtf, self.config)
             if signal:
                 lines.append(f"{signal.action.title()} - {signal.reason}")
                 self.logger.info("\n" + "\n".join(lines) + "\n" + "=" * 41)
-                self.execute_signal(symbol, signal, state)
+                indicators = {
+                    "fast_sma": fast,
+                    "slow_sma": slow,
+                    "rsi": rsi_val,
+                    "atr": atr_val,
+                    "volume_ratio": vol_ratio,
+                    "session_vwap": session_vwap,
+                    "breakout_price": breakout_price,
+                }
+                self.execute_signal(symbol, signal, state, indicators)
             else:
                 lines.append("No Trade")
+                if self.config.log_skipped_signals and self.config.log_strategy_details:
+                    # Log which conditions failed
+                    failed = [name for name, ok in checks.items() if not ok]
+                    if failed:
+                        self.logger.info("[%s] Skipped: %s", symbol, ", ".join(failed))
                 self.logger.info("\n" + "\n".join(lines) + "\n" + "=" * 41)
 
         self._send_hourly_notification(now, "Trend bot is alive and checked the market.")

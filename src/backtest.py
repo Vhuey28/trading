@@ -1,4 +1,3 @@
-
 """
 backtest.py — Trend-bot backtester
 ====================================
@@ -47,7 +46,7 @@ def symbol_file_stem(symbol: str) -> str:
 
 
 def _weekdays_in_range(start: date, end: date) -> list[date]:
-    #Return every Mon–Fri between start (inclusive) and end (inclusive).
+    # Return every Mon–Fri between start (inclusive) and end (inclusive).
     days: list[date] = []
     cur = start
     while cur <= end:
@@ -101,7 +100,7 @@ def fetch_and_cache(
     symbol: str, day: date, config: BotConfig,
     data_dir: Path, logger: logging.Logger,
 ) -> list[Bar]:
-    #Download bars for *symbol* on *day* from Alpaca and cache to CSV.
+    # Download bars for *symbol* on *day* from Alpaca and cache to CSV.
     from alpaca_client import AlpacaClient
     from zoneinfo import ZoneInfo
 
@@ -128,7 +127,7 @@ def _load_day(
     symbol: str, day: date, config: BotConfig,
     data_dir: Path, logger: logging.Logger, fetch_missing: bool,
 ) -> list[Bar] | None:
-    #Load (optionally fetch) bars for one symbol/day. Returns None on miss.
+    # Load (optionally fetch) bars for one symbol/day. Returns None on miss.
     path = data_dir / f"{symbol_file_stem(symbol)}_{day.isoformat()}_{config.timeframe}.csv"
     if not path.exists():
         if fetch_missing:
@@ -174,6 +173,134 @@ class SymbolResult:
         self.total_pnl = sum(t.pnl for t in closed)
         self.wins      = sum(1 for t in closed if t.pnl > 0)
         self.losses    = sum(1 for t in closed if t.pnl <= 0)
+
+
+@dataclass
+class BacktestSummary:
+    """Aggregated summary across all symbols"""
+    total_trades: int = 0
+    total_pnl: float = 0.0
+    total_wins: int = 0
+    total_losses: int = 0
+    max_drawdown: float = 0.0
+    profit_factor: float = 0.0
+    expectancy: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    largest_win: float = 0.0
+    largest_loss: float = 0.0
+    consecutive_wins: int = 0
+    consecutive_losses: int = 0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+
+    @property
+    def win_rate(self) -> float:
+        if self.total_trades == 0:
+            return 0.0
+        return self.total_wins / self.total_trades * 100.0
+
+    @property
+    def avg_trade(self) -> float:
+        if self.total_trades == 0:
+            return 0.0
+        return self.total_pnl / self.total_trades
+
+
+def calculate_equity_curve(trades: list[BacktestTrade]) -> list[float]:
+    """Calculate equity curve from trades"""
+    equity = 0.0
+    curve = []
+    for trade in trades:
+        if trade.pnl is not None:
+            equity += trade.pnl
+            curve.append(equity)
+    return curve
+
+
+def calculate_drawdown(equity_curve: list[float]) -> tuple[float, float]:
+    """Calculate max drawdown and max drawdown %"""
+    if not equity_curve:
+        return 0.0, 0.0
+    peak = equity_curve[0]
+    max_dd = 0.0
+    max_dd_pct = 0.0
+    for value in equity_curve:
+        if value > peak:
+            peak = value
+        dd = peak - value
+        if dd > max_dd:
+            max_dd = dd
+        if peak != 0:
+            dd_pct = dd / peak * 100
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+    return max_dd, max_dd_pct
+
+
+def calculate_profit_factor(trades: list[BacktestTrade]) -> float:
+    """Calculate profit factor (gross profit / gross loss)"""
+    gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
+    gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
+    if gross_loss == 0:
+        return float('inf') if gross_profit > 0 else 0.0
+    return gross_profit / gross_loss
+
+
+def calculate_expectancy(trades: list[BacktestTrade]) -> float:
+    """Calculate expectancy (average P&L per trade)"""
+    if not trades:
+        return 0.0
+    return sum(t.pnl for t in trades) / len(trades)
+
+
+def calculate_consecutive(trades: list[BacktestTrade]) -> tuple[int, int]:
+    """Calculate max consecutive wins and losses"""
+    max_wins = 0
+    max_losses = 0
+    current_wins = 0
+    current_losses = 0
+
+    for trade in trades:
+        if trade.pnl > 0:
+            current_wins += 1
+            current_losses = 0
+            max_wins = max(max_wins, current_wins)
+        else:
+            current_losses += 1
+            current_wins = 0
+            max_losses = max(max_losses, current_losses)
+
+    return max_wins, max_losses
+
+
+def compute_summary(results: list[SymbolResult]) -> BacktestSummary:
+    """Compute aggregate summary statistics across all symbols"""
+    all_trades = []
+    for r in results:
+        closed = [t for t in r.trades if t.exit_price is not None]
+        all_trades.extend(closed)
+
+    all_trades.sort(key=lambda t: t.entry_time)
+
+    summary = BacktestSummary()
+    summary.total_trades = len(all_trades)
+    summary.total_wins = sum(1 for t in all_trades if t.pnl > 0)
+    summary.total_losses = sum(1 for t in all_trades if t.pnl <= 0)
+    summary.total_pnl = sum(t.pnl for t in all_trades)
+
+    if all_trades:
+        equity_curve = calculate_equity_curve(all_trades)
+        summary.max_drawdown, _ = calculate_drawdown(equity_curve)
+        summary.profit_factor = calculate_profit_factor(all_trades)
+        summary.expectancy = calculate_expectancy(all_trades)
+        summary.avg_win = sum(t.pnl for t in all_trades if t.pnl > 0) / max(1, summary.total_wins)
+        summary.avg_loss = sum(t.pnl for t in all_trades if t.pnl <= 0) / max(1, summary.total_losses)
+        summary.largest_win = max(t.pnl for t in all_trades)
+        summary.largest_loss = min(t.pnl for t in all_trades)
+        summary.max_consecutive_wins, summary.max_consecutive_losses = calculate_consecutive(all_trades)
+
+    return summary
 
 
 # ── per-symbol backtester ─────────────────────────────────────────────────────
@@ -287,6 +414,72 @@ def backtest_symbol(
     return result
 
 
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+def export_trades_csv(results: list[SymbolResult], config: BotConfig, root_dir: Path) -> Path:
+    """Export all trades to CSV file"""
+    csv_path = root_dir / config.trades_csv_path
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_trades = []
+    for r in results:
+        for t in r.trades:
+            if t.exit_price is not None:
+                all_trades.append(t)
+
+    all_trades.sort(key=lambda t: t.entry_time)
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "symbol", "entry_time", "exit_time", "entry_price", "exit_price",
+            "pnl", "pnl_pct", "exit_reason", "notional_usd"
+        ])
+        for t in all_trades:
+            writer.writerow([
+                t.symbol,
+                t.entry_time.isoformat(),
+                t.exit_time.isoformat() if t.exit_time else "",
+                t.entry_price,
+                t.exit_price,
+                t.pnl,
+                t.pnl_pct,
+                t.exit_reason,
+                config.notional_usd,
+            ])
+
+    return csv_path
+
+
+def export_equity_curve_csv(results: list[SymbolResult], config: BotConfig, root_dir: Path) -> Path:
+    """Export equity curve to CSV"""
+    csv_path = root_dir / config.log_dir / "equity_curve.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_trades = []
+    for r in results:
+        for t in r.trades:
+            if t.exit_price is not None:
+                all_trades.append(t)
+
+    all_trades.sort(key=lambda t: t.entry_time)
+
+    equity = 0.0
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "equity", "trade_pnl", "symbol"])
+        for t in all_trades:
+            equity += t.pnl
+            writer.writerow([
+                t.exit_time.isoformat(),
+                equity,
+                t.pnl,
+                t.symbol,
+            ])
+
+    return csv_path
+
+
 # ── report printer ────────────────────────────────────────────────────────────
 
 def print_report(results: list[SymbolResult], config: BotConfig) -> None:
@@ -297,11 +490,9 @@ def print_report(results: list[SymbolResult], config: BotConfig) -> None:
           f"stop={config.stop_loss_pct*100:.1f}%  "
           f"tp={config.take_profit_pct*100:.1f}%  "
           f"trail={config.trail_stop_pct*100:.1f}%")
+    if config.use_atr_stops:
+        print(f"  ATR stops: SL={config.atr_stop_loss_multiplier}x TP={config.atr_take_profit_multiplier}x Trail={config.atr_trail_stop_multiplier}x")
     print(f"{'='*W}")
-
-    grand_pnl    = 0.0
-    grand_trades = 0
-    grand_wins   = 0
 
     for r in results:
         closed = [t for t in r.trades if t.exit_price is not None]
@@ -315,13 +506,31 @@ def print_report(results: list[SymbolResult], config: BotConfig) -> None:
         best         = max(t.pnl for t in closed)
         worst        = min(t.pnl for t in closed)
 
+        # Per-symbol stats
+        equity_curve = calculate_equity_curve(closed)
+        max_dd, max_dd_pct = calculate_drawdown(equity_curve)
+        profit_factor = calculate_profit_factor(closed)
+        expectancy = calculate_expectancy(closed)
+        max_consec_wins, max_consec_losses = calculate_consecutive(closed)
+
+        avg_win = sum(t.pnl for t in closed if t.pnl > 0) / max(1, r.wins)
+        avg_loss = sum(t.pnl for t in closed if t.pnl <= 0) / max(1, r.losses)
+
         print(f"\n  {r.symbol} ({r.days_tested} trading days)")
-        print(f"    Trades     : {total_trades}  "
-              f"({r.wins}W / {r.losses}L,  {win_rate:.0f}% win rate)")
-        print(f"    Net P&L    : ${r.total_pnl:+.2f}")
-        print(f"    Avg/trade  : ${avg_pnl:+.2f}")
-        print(f"    Best trade : ${best:+.2f}")
-        print(f"    Worst trade: ${worst:+.2f}")
+        print(f"    Trades       : {total_trades}  ({r.wins}W / {r.losses}L,  {win_rate:.0f}% win rate)")
+        print(f"    Net P&L      : ${r.total_pnl:+.2f}")
+        print(f"    Avg/trade    : ${avg_pnl:+.2f}")
+        print(f"    Best trade   : ${best:+.2f}")
+        print(f"    Worst trade  : ${worst:+.2f}")
+        print(f"    Avg Win      : ${avg_win:+.2f}")
+        print(f"    Avg Loss     : ${avg_loss:+.2f}")
+        print(f"    Profit Factor: {profit_factor:.2f}" if profit_factor != float('inf') else "    Profit Factor: ∞")
+        print(f"    Expectancy   : ${expectancy:+.2f}")
+        print(f"    Max Drawdown : -${max_dd:.2f} ({max_dd_pct:.1f}%)")
+        print(f"    Max Consec W : {max_consec_wins}")
+        print(f"    Max Consec L : {max_consec_losses}")
+
+        # Trade details
         print()
         hdr = f"    {'Entry':16}  {'Exit':16}  {'Entry$':>8}  {'Exit$':>8}  {'P&L':>8}  Reason"
         print(hdr)
@@ -334,15 +543,20 @@ def print_report(results: list[SymbolResult], config: BotConfig) -> None:
                   f"${t.entry_price:>7.2f}  ${t.exit_price:>7.2f}  "
                   f"${t.pnl:>+7.2f}  {flag} {t.exit_reason}")
 
-        grand_pnl    += r.total_pnl
-        grand_trades += total_trades
-        grand_wins   += r.wins
-
-    gwr = grand_wins / grand_trades * 100 if grand_trades else 0.0
+    # Grand summary
+    summary = compute_summary(results)
     print(f"\n{'='*W}")
-    print(f"  ALL SYMBOLS  {grand_trades} trades  "
-          f"{grand_wins}W / {grand_trades - grand_wins}L  "
-          f"{gwr:.0f}% win rate  Net P&L ${grand_pnl:+.2f}")
+    print(f"  ALL SYMBOLS  {summary.total_trades} trades  "
+          f"{summary.total_wins}W / {summary.total_losses}L  "
+          f"{summary.win_rate:.0f}% win rate  Net P&L ${summary.total_pnl:+.2f}")
+    print(f"  Avg Trade    : ${summary.avg_trade:+.2f}")
+    print(f"  Profit Factor: {summary.profit_factor:.2f}" if summary.profit_factor != float('inf') else "  Profit Factor: ∞")
+    print(f"  Expectancy   : ${summary.expectancy:+.2f}")
+    print(f"  Max Drawdown : ${summary.max_drawdown:+.2f}")
+    print(f"  Max Consec W : {summary.max_consecutive_wins}")
+    print(f"  Max Consec L : {summary.max_consecutive_losses}")
+    print(f"  Largest Win  : ${summary.largest_win:+.2f}")
+    print(f"  Largest Loss : ${summary.largest_loss:+.2f}")
     print(f"{'='*W}\n")
 
 
@@ -364,6 +578,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Override symbols (default: use config.json)")
     p.add_argument("--fetch",    action="store_true",
                    help="Download missing bar CSVs from Alpaca before testing")
+    p.add_argument("--export-csv", action="store_true",
+                   help="Export trades and equity curve to CSV")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print every buy/sell signal (DEBUG logging)")
     return p.parse_args(argv)
@@ -426,9 +642,16 @@ def main(argv: list[str] | None = None) -> int:
         results.append(r)
 
     print_report(results, config)
+
+    # Export CSVs if requested
+    if args.export_csv or config.export_trades_csv:
+        trades_path = export_trades_csv(results, config, root_dir)
+        equity_path = export_equity_curve_csv(results, config, root_dir)
+        print(f"\n  Exported trades to: {trades_path}")
+        print(f"  Exported equity curve to: {equity_path}")
+
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

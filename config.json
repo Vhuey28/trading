@@ -16,7 +16,7 @@
 
   "notional_usd": 25.0,
 
-  "poll_seconds": 60,
+  "poll_seconds": 15,
 
   "timeframe": "1Min",
 
@@ -30,24 +30,58 @@
   "data_dir": "data",
   "log_dir": "logs",
   "state_file": "state/trend_bot_state.json",
+  "trades_csv_path": "logs/trades.csv",
+  "archive_dir": "archive",
 
-  "max_daily_trades": 6,
-  "min_minutes_between_trades": 30,
+  "max_daily_trades": 10,
+  "min_minutes_between_trades": 15,
 
-  "fast_sma_period": 20,
-  "slow_sma_period": 50,
+  "fast_sma_period": 8,
+  "slow_sma_period": 21,
 
-  "lookback_minutes": 180,
+  "lookback_minutes": 60,
 
-  "breakout_buffer_pct": 0.0015,
+  "breakout_buffer_pct": 0.002,
 
-  "stop_loss_pct": 0.02,
-  "take_profit_pct": 0.04,
-  "trail_stop_pct": 0.015,
+  "stop_loss_pct": 0.012,
+  "take_profit_pct": 0.035,
+  "trail_stop_pct": 0.012,
 
   "exit_when_window_closes": true,
 
   "require_previous_day_uptrend": true,
   "log_strategy_details": true,
-  "minimum_volume_multiplier": 1.25
+  "log_skipped_signals": true,
+  "export_trades_csv": true,
+  "minimum_volume_multiplier": 1.25,
+
+  "rsi_period": 14,
+  "volume_period": 20,
+  "atr_period": 14,
+
+  "use_adaptive_volume": true,
+  "volume_ratio_pre_market": 1.2,
+  "volume_ratio_regular_hours": 0.6,
+
+  "use_atr_breakout": true,
+  "atr_breakout_multiplier": 0.5,
+
+  "use_pullback_entry": true,
+  "pullback_tolerance_pct": 0.002,
+  "pullback_rsi_threshold": 50.0,
+
+  "use_vwap_continuation_entry": true,
+  "vwap_rsi_threshold": 55.0,
+  "vwap_volume_threshold": 0.6,
+
+  "use_atr_stops": true,
+  "atr_stop_loss_multiplier": 2.0,
+  "atr_take_profit_multiplier": 4.0,
+  "atr_trail_stop_multiplier": 1.5,
+
+  "use_multi_timeframe": true,
+  "trend_timeframe": "5Min",
+  "trend_sma_period": 50,
+
+  "use_breakout_entry": true
 }

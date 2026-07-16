@@ -7,9 +7,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import os
+from dotenv import load_dotenv
 from models import Bar
 from utils import parse_alpaca_timestamp
 from datetime import datetime, timezone
+
+
+# Load .env file automatically
+load_dotenv()
 
 
 class AlpacaClient:
@@ -46,11 +51,13 @@ class AlpacaClient:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
+        self.logger.debug("Alpaca API request: %s %s", method, url)
         for attempt in range(1, 4):
             request = Request(url, data=data, method=method, headers=headers)
             try:
                 with urlopen(request, timeout=30) as response:
                     raw = response.read().decode("utf-8")
+                    self.logger.debug("Alpaca API response (%s): %s", response.status, raw[:500] if raw else "<empty>")
                     if not raw:
                         return None
                     return json.loads(raw)
@@ -58,21 +65,34 @@ class AlpacaClient:
                 if expected_404 and exc.code == 404:
                     return None
                 detail = exc.read().decode("utf-8", errors="replace")
+                self.logger.warning(
+                    "Alpaca API error: %s %s -> HTTP %s: %s",
+                    method,
+                    url,
+                    exc.code,
+                    detail,
+                )
                 if exc.code in {429, 500, 502, 503, 504} and attempt < 3:
                     sleep_for = attempt * 2
                     self.logger.warning(
-                        "Alpaca returned %s; retrying in %ss. %s",
+                        "Alpaca returned %s; retrying in %ss (attempt %d/3)",
                         exc.code,
                         sleep_for,
-                        detail,
+                        attempt,
                     )
                     time.sleep(sleep_for)
                     continue
                 raise RuntimeError(f"Alpaca request failed with HTTP {exc.code}: {detail}") from exc
             except URLError as exc:
+                self.logger.warning(
+                    "Network error on %s %s: %s",
+                    method,
+                    url,
+                    exc,
+                )
                 if attempt < 3:
                     sleep_for = attempt * 2
-                    self.logger.warning("Network error; retrying in %ss. %s", sleep_for, exc)
+                    self.logger.warning("Retrying in %ss (attempt %d/3)", sleep_for, attempt)
                     time.sleep(sleep_for)
                     continue
                 raise RuntimeError(f"Network error contacting Alpaca: {exc}") from exc
@@ -83,6 +103,7 @@ class AlpacaClient:
         if isinstance(raw_bars, list):
             return [self._bar_from_payload(item) for item in raw_bars]
         if not isinstance(raw_bars, dict):
+            self.logger.debug("[%s] Unexpected bars format: %s", symbol, type(raw_bars))
             return []
         candidates = [
             symbol,
@@ -91,6 +112,7 @@ class AlpacaClient:
             symbol.upper(),
             symbol.upper().replace("/", ""),
         ]
+        self.logger.debug("[%s] Available bar keys in response: %s", symbol, list(raw_bars.keys()))
         selected = None
         for candidate in candidates:
             if candidate in raw_bars:
@@ -99,6 +121,7 @@ class AlpacaClient:
         if selected is None and len(raw_bars) == 1:
             selected = next(iter(raw_bars.values()))
         if selected is None:
+            self.logger.debug("[%s] No matching bars found for candidates: %s", symbol, candidates)
             return []
         if isinstance(selected, dict):
             return [self._bar_from_payload(selected)]
@@ -131,11 +154,45 @@ class AlpacaClient:
             params["feed"] = self.config.stock_feed
         if getattr(self.config, "stock_adjustment", None):
             params["adjustment"] = self.config.stock_adjustment
+
+        # Note: v2/stocks/bars does NOT support extended_hours parameter.
+        # Extended hours data is included based on feed type:
+        # - 'sip' feed includes pre-market (4am-9:30am ET) and after-hours (4pm-8pm ET)
+        # - 'iex' feed only includes regular hours (9:30am-4pm ET) and limited extended
+        # - 'otc' feed for OTC markets
+        # The extended_hours config option is used for order placement, not data retrieval.
         url = f"{self.config.data_base_url}/v2/stocks/bars"
+
+        # Detailed logging for debugging live bars issue
+        self.logger.debug(
+            "[%s] Fetching %s bars from %s to %s (feed=%s)",
+            symbol,
+            timeframe,
+            start.astimezone(timezone.utc).isoformat(),
+            end.astimezone(timezone.utc).isoformat(),
+            params.get("feed", "default"),
+        )
+
         payload = self.request_json("GET", url, params=params)
         if not isinstance(payload, dict):
+            self.logger.warning(
+                "[%s] Unexpected response from Alpaca bars API: %s",
+                symbol,
+                type(payload).__name__,
+            )
             return []
-        return self._extract_bars(payload, symbol)
+        bars = self._extract_bars(payload, symbol)
+        self.logger.debug(
+            "[%s] Fetched %d bars (requested range: %s to %s, timeframe: %s, feed: %s, extended_hours: %s)",
+            symbol,
+            len(bars),
+            start.astimezone(timezone.utc).isoformat(),
+            end.astimezone(timezone.utc).isoformat(),
+            timeframe,
+            params.get("feed", "default"),
+            params.get("extended_hours", "false"),
+        )
+        return bars
 
     def fetch_crypto_bars(self, symbol: str, start, end, timeframe: str) -> list[Bar]:
         bars = []
@@ -152,13 +209,35 @@ class AlpacaClient:
             if page_token:
                 params["page_token"] = page_token
             url = f"{self.config.data_base_url}/v1beta3/crypto/{self.config.crypto_location}/bars"
+
+            self.logger.debug(
+                "[%s] Fetching crypto %s bars from %s to %s",
+                symbol,
+                timeframe,
+                start.astimezone(timezone.utc).isoformat(),
+                end.astimezone(timezone.utc).isoformat(),
+            )
+
             payload = self.request_json("GET", url, params=params)
             if not isinstance(payload, dict):
+                self.logger.warning(
+                    "[%s] Unexpected response from Alpaca crypto bars API: %s",
+                    symbol,
+                    type(payload).__name__,
+                )
                 break
             bars.extend(self._extract_bars(payload, symbol))
             page_token = payload.get("next_page_token")
             if not page_token:
                 break
+        self.logger.debug(
+            "[%s] Fetched %d total crypto bars (range: %s to %s, timeframe: %s)",
+            symbol,
+            len(bars),
+            start.astimezone(timezone.utc).isoformat(),
+            end.astimezone(timezone.utc).isoformat(),
+            timeframe,
+        )
         return bars
 
     def fetch_latest_bar(self, symbol: str):
@@ -174,6 +253,57 @@ class AlpacaClient:
         url = f"{self.config.trading_base_url}/v2/positions/{encoded}"
         payload = self.request_json("GET", url, expected_404=True)
         return payload if isinstance(payload, dict) else None
+
+    def get_clock(self) -> dict[str, Any] | None:
+        """Get current market clock status from Alpaca."""
+        url = f"{self.config.trading_base_url}/v2/clock"
+        payload = self.request_json("GET", url)
+        if isinstance(payload, dict):
+            self.logger.debug(
+                "Market clock: is_open=%s, next_open=%s, next_close=%s, timestamp=%s",
+                payload.get("is_open"),
+                payload.get("next_open"),
+                payload.get("next_close"),
+                payload.get("timestamp"),
+            )
+            return payload
+        self.logger.warning("Unexpected response from Alpaca clock API: %s", type(payload).__name__)
+        return None
+
+    def is_market_open(self) -> bool:
+        """Check if the market is currently open (regular hours only)."""
+        clock = self.get_clock()
+        return bool(clock and clock.get("is_open"))
+
+    def is_market_open_extended(self) -> bool:
+        """
+        Check if the market is currently open for trading including extended hours.
+        Alpaca's clock API only returns is_open for regular hours, so we check
+        if current time is between next_open and next_close (which include extended hours).
+        """
+        from datetime import datetime, timezone
+        clock = self.get_clock()
+        if not clock:
+            return False
+
+        now = datetime.now(timezone.utc)
+        next_open_str = clock.get("next_open")
+        next_close_str = clock.get("next_close")
+        timestamp_str = clock.get("timestamp")
+
+        if not next_open_str or not next_close_str or not timestamp_str:
+            self.logger.debug("Clock missing next_open/next_close/timestamp; falling back to is_open")
+            return bool(clock.get("is_open"))
+
+        try:
+            # Parse timestamps (they come in ISO format with Z or +00:00)
+            next_open = datetime.fromisoformat(next_open_str.replace("Z", "+00:00"))
+            next_close = datetime.fromisoformat(next_close_str.replace("Z", "+00:00"))
+            # Check if current time is between next_open and next_close
+            return next_open <= now <= next_close
+        except Exception as e:
+            self.logger.warning("Failed to parse clock times: %s", e)
+            return bool(clock.get("is_open"))
 
     def place_market_buy(self, symbol: str, notional_usd: float):
         body = {
