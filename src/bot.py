@@ -2,24 +2,27 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
+import os
 import time
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from config import BotConfig
-from logger import configure_logging
-from alpaca_client import AlpacaClient
-from indicators import compute_previous_day_levels
-from strategy import build_signal
-from utils import (
+from src.config import BotConfig
+from src.logger import configure_logging, LOGGER_NAME
+from src.alpaca_client import AlpacaClient
+from src.indicators import compute_previous_day_levels, atr
+from src.strategy import build_signal
+from src.telegram_notifier import TelegramNotifier
+from src.utils import (
     parse_alpaca_timestamp,
     is_trade_window_open,
     previous_data_day,
     send_macos_notification,
 )
-from models import Bar, PreviousDayLevels, TradeSignal
+from src.models import Bar, PreviousDayLevels, TradeSignal
 
 
 def symbol_file_stem(symbol: str) -> str:
@@ -38,6 +41,14 @@ class TrendBot:
         self.previous_levels: dict[str, PreviousDayLevels] = {}
         self.previous_levels_requested_day: dict[str, date] = {}
         self.last_notification_hour: int | None = None
+
+        # Telegram notifier
+        self.notifier = TelegramNotifier(
+            bot_token=config.telegram_bot_token,
+            chat_id=config.telegram_chat_id,
+            logger=self.logger,
+            enabled=config.telegram_enabled,
+        )
 
         # CSV trade export
         self.trades_csv_path = self.resolve_path(config.trades_csv_path)
@@ -66,13 +77,31 @@ class TrendBot:
                     "timestamp", "symbol", "action", "price", "reason",
                     "entry_price", "exit_price", "pnl", "pnl_pct", "notional",
                     "fast_sma", "slow_sma", "rsi", "atr", "volume_ratio",
-                    "session_vwap", "breakout_price"
+                    "session_vwap", "breakout_price",
+                    # New analytics fields
+                    "entry_reason", "exit_reason", "r_multiple", "atr_at_entry",
+                    "adx_at_entry", "vwap_at_entry", "volume_ratio_at_entry",
+                    "trade_duration_minutes", "hour_of_day", "day_of_week",
+                    "strategy", "position_size", "risk_per_trade"
                 ])
 
     def load_state(self) -> dict[str, Any]:
         if not self.state_file.exists():
             return {}
-        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        try:
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except Exception:
+            # Corrupt / partially-written state (e.g. crash or a stale file from
+            # before atomic writes). Preserve it for inspection and start clean
+            # so the bot can recover autonomously instead of failing forever.
+            self.logger.error("State file %s is unreadable; starting from empty state", self.state_file)
+            try:
+                corrupt = self.state_file.with_suffix(self.state_file.suffix + ".corrupt")
+                corrupt.write_text(self.state_file.read_text(encoding="utf-8", errors="replace"))
+                self.logger.warning("Backed up corrupt state to %s", corrupt)
+            except Exception:
+                pass
+            state = {}
         if "in_position" in state and "symbols" not in state:
             symbol = self.config.symbol
             state["symbols"] = {
@@ -89,7 +118,16 @@ class TrendBot:
 
     def save_state(self, state: dict[str, Any]) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        # Write to a temp file in the same directory, then atomically rename.
+        # A crash mid-write can never leave a truncated state file at the real
+        # path — the reader sees either the old or the new complete file.
+        tmp_path = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, self.state_file)
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
 
     def previous_day_cache_path(self, symbol: str, day: date) -> Path:
         stem = symbol_file_stem(symbol)
@@ -108,6 +146,58 @@ class TrendBot:
         if self._uses_stock_endpoint(symbol):
             return self.client.fetch_stock_bars(symbol, start, end, timeframe)
         return self.client.fetch_crypto_bars(symbol, start, end, timeframe)
+
+    def _fetch_regime_data(self, now: datetime) -> dict[str, Any]:
+        """Fetch SPY and QQQ bars for market regime filter"""
+        regime_data = {}
+        try:
+            # Need enough bars for 200 EMA + 50 EMA calculations
+            lookback = max(self.config.regime_spy_ema_200 * 3, 500)
+            end = now.astimezone(timezone.utc)
+            start = end - timedelta(minutes=lookback)
+
+            spy_bars = self._fetch_bars_with_timeframe(
+                self.config.regime_spy_symbol, start, end, "1Min"
+            )
+            qqq_bars = self._fetch_bars_with_timeframe(
+                self.config.regime_qqq_symbol, start, end, "1Min"
+            )
+
+            if spy_bars:
+                regime_data["spy_bars"] = spy_bars
+            if qqq_bars:
+                regime_data["qqq_bars"] = qqq_bars
+
+            self.logger.debug("Fetched regime data: SPY=%d bars, QQQ=%d bars",
+                             len(spy_bars), len(qqq_bars))
+        except Exception as e:
+            self.logger.warning("Failed to fetch regime data: %s", e)
+        return regime_data
+
+    def _fetch_secondary_trend_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        """Fetch secondary timeframe bars (e.g., 15Min) for multi-timeframe confirmation"""
+        if not self.config.use_secondary_timeframe:
+            return []
+
+        try:
+            end = now.astimezone(timezone.utc)
+            # Need enough bars for secondary_trend_sma_period
+            lookback = max(self.config.secondary_trend_sma_period * 5, self.config.lookback_minutes * 5)
+            start = end - timedelta(minutes=lookback)
+
+            bars = self._fetch_bars_with_timeframe(
+                symbol,
+                start=start,
+                end=end,
+                timeframe=self.config.secondary_trend_timeframe,
+            )
+            self.logger.debug("[%s] Fetched %d secondary trend bars (%s)",
+                             symbol, len(bars), self.config.secondary_trend_timeframe)
+            return bars
+        except Exception as e:
+            self.logger.warning("[%s] Failed to fetch secondary trend bars (%s): %s",
+                               symbol, self.config.secondary_trend_timeframe, e)
+            return []
 
     def read_bars_csv(self, path: Path) -> list[Bar]:
         bars: list[Bar] = []
@@ -395,6 +485,18 @@ class TrendBot:
             self.logger.warning("[%s] Failed to fetch trend bars (%s): %s", symbol, self.config.trend_timeframe, e)
             return []
 
+    @staticmethod
+    def _order_fill_price(order: dict[str, Any] | None) -> float | None:
+        """Best-effort broker fill price; returns the first present fill field or None."""
+        if isinstance(order, dict):
+            fill = order.get("avg_fill_price") or order.get("filled_avg_price")
+            if fill:
+                try:
+                    return float(fill)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
     def sync_live_position(self, symbol: str, symbol_state: dict[str, Any]) -> None:
         if self.config.dry_run:
             return
@@ -421,7 +523,7 @@ class TrendBot:
         next_allowed = last + timedelta(minutes=self.config.min_minutes_between_trades)
         return now >= next_allowed
 
-    def record_trade(self, state: dict[str, Any], symbol: str, signal: TradeSignal, order: dict[str, Any] | None) -> None:
+    def record_trade(self, state: dict[str, Any], symbol: str, signal: TradeSignal, order: dict[str, Any] | None, notional: float | None = None) -> None:
         now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         state["last_trade_at"] = now_str
         state["trade_count"] = int(state.get("trade_count", 0)) + 1
@@ -432,12 +534,28 @@ class TrendBot:
         symbol_state["last_order_id"] = order.get("id") if order else None
         if signal.action == "buy":
             symbol_state["in_position"] = True
-            symbol_state["entry_price"] = signal.price
-            symbol_state["highest_price_since_entry"] = signal.price
+            # Prefer the broker's reported fill price; fall back to the signal
+            # price (last bar close) when the response has no fill yet.
+            fill = self._order_fill_price(order)
+            entry = float(fill) if fill is not None else float(signal.price)
+            symbol_state["entry_price"] = entry
+            filled_qty = None
+            if isinstance(order, dict):
+                fq = order.get("filled_qty")
+                if fq:
+                    try:
+                        filled_qty = float(fq)
+                    except (TypeError, ValueError):
+                        filled_qty = None
+            # Persist the executed qty so exit P&L uses the real size, including
+            # when ATR position sizing was applied.
+            symbol_state["entry_qty"] = filled_qty or ((notional if notional is not None else self.config.notional_usd) / entry)
+            symbol_state["highest_price_since_entry"] = entry
         elif signal.action == "sell":
             symbol_state["in_position"] = False
             symbol_state["entry_price"] = None
             symbol_state["highest_price_since_entry"] = None
+            symbol_state.pop("entry_qty", None)
 
     def export_trade_to_csv(
         self,
@@ -454,9 +572,39 @@ class TrendBot:
         if not self.config.export_trades_csv:
             return
 
+        # Calculate additional analytics
+        r_multiple = ""
+        if pnl is not None and entry_price is not None and indicators.get("atr") is not None:
+            atr_at_entry = indicators.get("atr")
+            risk_atr = atr_at_entry * self.config.atr_stop_loss_multiplier if self.config.use_atr_stops else entry_price * self.config.stop_loss_pct
+            if risk_atr > 0:
+                r_multiple = round(pnl / risk_atr, 2)
+
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with self.trades_csv_path.open("a", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
+            # Determine strategy name from reason
+            reason = signal.reason.lower()
+            if "breakout" in reason:
+                strategy = "breakout"
+            elif "pullback" in reason:
+                strategy = "pullback"
+            elif "vwap" in reason:
+                strategy = "vwap_continuation"
+            else:
+                strategy = "unknown"
+
+            # Calculate trade duration for exits
+            trade_duration_minutes = ""
+            hour_of_day = ""
+            day_of_week = ""
+            if signal.action == "sell" and entry_price is not None:
+                # Use current time as exit time
+                exit_time = datetime.now(self.tz)
+                # We'd need entry_time - for now leave blank as we don't track it in state
+                hour_of_day = exit_time.hour
+                day_of_week = exit_time.strftime("%A")
+
             writer.writerow([
                 now,
                 symbol,
@@ -475,6 +623,20 @@ class TrendBot:
                 indicators.get("volume_ratio", ""),
                 indicators.get("session_vwap", ""),
                 indicators.get("breakout_price", ""),
+                # New analytics fields
+                signal.reason if signal.action == "buy" else "",  # entry_reason
+                signal.reason if signal.action == "sell" else "",  # exit_reason
+                r_multiple,
+                indicators.get("atr", ""),
+                "",  # adx_at_entry - would need to pass from strategy
+                indicators.get("session_vwap", ""),
+                indicators.get("volume_ratio", ""),
+                trade_duration_minutes,
+                hour_of_day,
+                day_of_week,
+                strategy,
+                self.config.notional_usd,  # position_size
+                self.config.risk_per_trade_usd if self.config.use_atr_position_sizing else ""
             ])
 
     def execute_signal(self, symbol: str, signal: TradeSignal, state: dict[str, Any], indicators: dict[str, Any] | None = None) -> None:
@@ -503,29 +665,71 @@ class TrendBot:
                 )
             return
 
+        # Calculate position size (ATR-based or fixed notional)
+        notional = self.config.notional_usd
+        if signal.action == "buy" and self.config.use_atr_position_sizing:
+            atr_val = indicators.get("atr") if indicators else None
+            if atr_val and atr_val > 0:
+                stop_distance = self.config.atr_stop_loss_multiplier * atr_val
+                if stop_distance > 0:
+                    # Risk per trade = notional / stop_distance * price
+                    notional = self.config.risk_per_trade_usd / stop_distance * signal.price
+                    # Cap at configured notional
+                    notional = min(notional, self.config.notional_usd)
+                    self.logger.info("[%s] ATR position sizing: atr=%.4f, stop_dist=%.4f, notional=%.2f",
+                                     symbol, atr_val, stop_distance, notional)
+
         entry_price = None
         exit_price = None
         pnl = None
         pnl_pct = None
 
+        # Best-effort real fill data from the broker; falls back to the signal
+        # (bar close) price when the immediate response has no fill fields yet.
+        def _fill_price(order: dict[str, Any] | None, default: float | None) -> float | None:
+            return self._order_fill_price(order) or default
+
+        def _order_rejected(order: dict[str, Any] | None) -> bool:
+            if not isinstance(order, dict):
+                return True  # None response = order was definitely not accepted
+            status = (order.get("status") or "").lower()
+            return status in {"rejected", "canceled", "expired"}
+
         if signal.action == "buy":
-            order = self.client.place_market_buy(symbol, self.config.notional_usd)
-            entry_price = signal.price
+            order = self.client.place_market_buy(symbol, notional)
+            if _order_rejected(order):
+                reason = (order or {}).get("status", "no response")
+                self.logger.error("[%s] BUY order was NOT accepted (status=%s); not recording a position.", symbol, reason)
+                self.notifier.error(f"order_{symbol}", f"BUY rejected (status={reason})")
+                return
+            entry_price = _fill_price(order, signal.price)
+            # Telegram notification
+            self.notifier.trade_opened(symbol, entry_price, signal.reason)
         elif signal.action == "sell":
             order = self.client.close_position(symbol)
-            exit_price = signal.price
-            # Calculate P&L if we have entry price
+            if order is None:
+                # Ambiguous: we cannot confirm the close. Keep the position marked
+                # open rather than believing we're flat when the position may still
+                # exist, so the loop does not blindly re-enter on top of it.
+                self.logger.error("[%s] SELL close returned no confirmation; NOT clearing position.", symbol)
+                self.notifier.error(f"order_{symbol}", "SELL close returned no confirmation; position not cleared")
+                return
+            exit_price = _fill_price(order, signal.price)
+            # Calculate P&L from the persisted entry and the real qty if known
             symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
-            if symbol_state.get("entry_price"):
-                entry = symbol_state["entry_price"]
-                qty = self.config.notional_usd / entry
-                pnl = (exit_price - entry) * qty
+            entry = symbol_state.get("entry_price")
+            if entry:
+                entry = float(entry)
+                qty = symbol_state.get("entry_qty") or (notional / entry)
+                pnl = (exit_price - entry) * float(qty)
                 pnl_pct = (exit_price / entry - 1.0) * 100.0
+                # Telegram notification
+                self.notifier.trade_closed(symbol, entry, exit_price, pnl, signal.reason)
         else:
             order = None
 
-        self.logger.info("[%s] Placed %s order: %s", symbol, signal.action, order)
-        self.record_trade(state, symbol, signal, order)
+        self.logger.info("[%s] Placed %s order: %s", symbol, signal.action, order if order is not None else "NONE")
+        self.record_trade(state, symbol, signal, order, notional)
 
         # Export trade to CSV
         if self.config.export_trades_csv and indicators:
@@ -593,6 +797,11 @@ class TrendBot:
         if not hasattr(self, "_bar_cache"):
             self._bar_cache = {}
 
+        # Pre-fetch regime data (SPY/QQQ) if market regime filter is enabled
+        regime_data = {}
+        if self.config.use_market_regime_filter:
+            regime_data = self._fetch_regime_data(now)
+
         for symbol in self.config.symbols:
             symbol_state = state.setdefault("symbols", {}).setdefault(symbol, {})
             self.sync_live_position(symbol, symbol_state)
@@ -601,6 +810,7 @@ class TrendBot:
                 levels = self.get_previous_day_levels(symbol, now)
             except Exception as e:
                 self.logger.error("[%s] Failed to get previous-day levels: %s", symbol, e)
+                self.notifier.error(f"prev_day_levels:{symbol}", f"{type(e).__name__}: {e}")
                 continue
 
             recent_bars = self.fetch_recent_bars(symbol, now)
@@ -630,14 +840,20 @@ class TrendBot:
 
             # Fetch trend timeframe bars for multi-timeframe confirmation
             trend_bars = []
+            secondary_trend_bars = []
             if self.config.use_multi_timeframe:
                 trend_bars = self.fetch_trend_bars(symbol, now)
+                # Fetch secondary timeframe (e.g., 15Min)
+                if self.config.use_secondary_timeframe:
+                    secondary_trend_bars = self._fetch_secondary_trend_bars(symbol, now)
 
             # compute indicators for logging and strategy
             ordered = sorted(recent_bars, key=lambda bar: bar.timestamp)
             closes = [bar.close for bar in ordered]
             price = closes[-1] if closes else None
-            from indicators import sma, atr, rsi, avg_volume, vwap
+            current_bar = ordered[-1] if ordered else None
+            current_time = current_bar.timestamp if current_bar else now
+            from src.indicators import sma, atr, rsi, avg_volume, vwap
 
             fast = sma(closes, self.config.fast_sma_period)
             slow = sma(closes, self.config.slow_sma_period)
@@ -654,10 +870,9 @@ class TrendBot:
             breakout_price = levels.high * (1.0 + self.config.breakout_buffer_pct)
             atr_breakout_price = None
             if self.config.use_atr_breakout and atr_val is not None:
-                atr_breakout_price = levels.high - (self.config.atr_breakout_buffer * atr_val)
+                atr_breakout_price = levels.high - (self.config.atr_breakout_multiplier * atr_val)
 
             # Check individual conditions for detailed logging
-            current_time = ordered[-1].timestamp
             market_time_str = current_time.strftime("%H:%M")
             is_pre_market = market_time_str < "10:30"
 
@@ -673,14 +888,16 @@ class TrendBot:
             # Multi-timeframe check
             mtf_ok = True
             if self.config.use_multi_timeframe and trend_bars:
-                from indicators import compute_multi_timeframe_trend
+                from src.indicators import compute_multi_timeframe_trend
                 mtf = compute_multi_timeframe_trend(
                     trend_bars, ordered,
                     self.config.trend_sma_period,
                     self.config.fast_sma_period,
-                    self.config.slow_sma_period
+                    self.config.slow_sma_period,
+                    secondary_trend_bars,
+                    self.config.secondary_trend_sma_period
                 )
-                mtf_ok = mtf.get("trend_up", True)
+                mtf_ok = mtf.get("trend_up", True) and mtf.get("secondary_trend_up", True)
 
             checks = {
                 "Trend Up": levels.trend == "up",
@@ -713,11 +930,18 @@ class TrendBot:
                 lines.append(("✓ " if ok else "✗ ") + name)
             lines.append("")
 
-            # Build signal with trend_bars for multi-timeframe
-            # We'll pass trend_bars through state temporarily
+            # Build signal with trend_bars for multi-timeframe and regime_data.
+            # build_signal mutates the working copy, so afterwards we persist the
+            # trailing high-water mark it ratcheted back onto the real state —
+            # otherwise the trailing stop would reset to entry/current price each
+            # poll and never lock in session gains (and live would diverge from
+            # the backtest, which passes the real object).
             symbol_state_with_mtf = dict(symbol_state)
             symbol_state_with_mtf["_trend_bars"] = trend_bars
-            signal = build_signal(levels, recent_bars, symbol_state_with_mtf, self.config)
+            symbol_state_with_mtf["_secondary_trend_bars"] = secondary_trend_bars
+            signal = build_signal(levels, recent_bars, symbol_state_with_mtf, self.config, regime_data)
+            if symbol_state.get("in_position") and symbol_state_with_mtf.get("highest_price_since_entry") is not None:
+                symbol_state["highest_price_since_entry"] = symbol_state_with_mtf["highest_price_since_entry"]
             if signal:
                 lines.append(f"{signal.action.title()} - {signal.reason}")
                 self.logger.info("\n" + "\n".join(lines) + "\n" + "=" * 41)
@@ -754,6 +978,8 @@ class TrendBot:
             self.config.trade_window_end,
             self.config.timezone,
         )
+        # Send startup notification via Telegram
+        self.notifier.startup(self.config.symbols, self.config)
         send_macos_notification(
             f"Trend Bot Started: {symbols_str}",
             "Trend bot is now running and monitoring market conditions.",
@@ -761,8 +987,9 @@ class TrendBot:
         while True:
             try:
                 self.run_once()
-            except Exception:
+            except Exception as exc:
                 self.logger.exception("Bot cycle failed")
+                self.notifier.error("poll_loop", f"{type(exc).__name__}: {exc}")
             time.sleep(max(10, int(self.config.poll_seconds)))
 
     def _send_hourly_notification(self, now: datetime, message: str) -> None:
@@ -785,6 +1012,46 @@ def parse_args(argv: list[str]) -> Any:
     return parser.parse_args(argv)
 
 
+def _acquire_lock(lock_path: Path) -> bool:
+    """Take an exclusive PID lock so two bot processes can't trade concurrently.
+
+    Returns True if the lock was acquired, False if another live instance holds it.
+    Auto-recovers a stale lock left by a crashed process.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            pid = int(lock_path.read_text().strip())
+            os.kill(pid, 0)  # Signal 0: raises if the process does not exist.
+            return False  # A live process holds the lock.
+        except (ValueError, ProcessLookupError):
+            pass  # Stale or empty lock; take it over.
+        except PermissionError:
+            return False  # Exists but owned elsewhere -> treat as held.
+    else:
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+            return True
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _release_lock(lock_path: Path) -> None:
+    try:
+        if lock_path.exists() and lock_path.read_text().strip() == str(os.getpid()):
+            lock_path.unlink()
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or None)
     config_path = Path(args.config).expanduser().resolve()
@@ -795,13 +1062,63 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(config.__dict__, indent=2, sort_keys=True))
         return 0
 
-    bot = TrendBot(config, root_dir)
-    if args.once:
-        bot.run_once()
-    else:
-        bot.run_forever()
+    # Single-instance guard: refuse to run a second process that could place
+    # duplicate/conflicting orders alongside the already-running instance.
+    lock_path = root_dir / "state" / "bot.pid"
+    if not _acquire_lock(lock_path):
+        logging.getLogger(LOGGER_NAME).error(
+            "Another instance appears to be running (lock: %s). Exiting to avoid duplicate trading.",
+            lock_path,
+        )
+        return 1
+
+    try:
+        bot = TrendBot(config, root_dir)
+        if args.once:
+            bot.run_once()
+        else:
+            bot.run_forever()
+    finally:
+        _release_lock(lock_path)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sys
+    import logging
+
+    # Set up basic logging for fatal errors
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("trend_bot")
+
+    # Import notifier here so it's available for exception handlers
+    from src.telegram_notifier import TelegramNotifier
+
+    # Build a notifier that honors the same telegram_enabled flag as the
+    # in-loop notifier, so crash / Ctrl+C alerts respect the user's setting.
+    # (Credentials come from .env via load_dotenv() in alpaca_client at import.)
+    def _crash_notifier() -> TelegramNotifier:
+        config = BotConfig.load(parse_args(sys.argv[1:] if len(sys.argv) > 1 else None).config)
+        return TelegramNotifier(
+            bot_token=config.telegram_bot_token,
+            chat_id=config.telegram_chat_id,
+            logger=logger,
+            enabled=config.telegram_enabled,
+        )
+
+    try:
+        notifier = _crash_notifier()
+    except Exception:
+        # Never let a notifier-construction problem mask the real error.
+        notifier = TelegramNotifier(None, None, logger, enabled=False)
+
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        notifier.shutdown("manual stop (Ctrl+C)")
+        logger.info("Bot stopped by user (Ctrl+C)")
+        sys.exit(0)
+    except Exception as exc:
+        logger.exception("Bot crashed")
+        notifier.error("fatal", f"Bot process crashed: {type(exc).__name__}: {exc}")
+        raise

@@ -27,6 +27,8 @@ cat > "$PLIST_PATH" <<PLIST
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>$LOG_DIR/launchd.out.log</string>
   <key>StandardErrorPath</key>

@@ -6,6 +6,7 @@ All settings can be overridden via config.json or environment variables.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +17,12 @@ from typing import Any
 class BotConfig:
     # Symbol & Account
     symbol: str = "QQQ"
+    symbols: list[str] | None = None
     timezone: str = "America/Los_Angeles"
     trade_window_start: str = "06:00"
     trade_window_end: str = "01:00"
     paper: bool = True
-    dry_run: bool = True
+    dry_run: bool = False
     notional_usd: float = 25.0
 
     # Polling & Data
@@ -34,8 +36,8 @@ class BotConfig:
     trades_csv_path: str = "logs/trades.csv"
 
     # Risk Management
-    max_daily_trades: int = 10
-    min_minutes_between_trades: int = 15
+    max_daily_trades: int = 900
+    min_minutes_between_trades: int = 5
 
     # Moving Averages
     fast_sma_period: int = 8
@@ -55,8 +57,10 @@ class BotConfig:
     # Exit Behavior
     exit_when_window_closes: bool = True
 
-    # Symbols (list takes precedence over single symbol)
-    symbols: list[str] = None
+    # Indicator Periods
+    rsi_period: int = 14
+    volume_period: int = 20
+    atr_period: int = 14
 
     # Alpaca Data Feed (stocks only)
     stock_feed: str | None = "iex"
@@ -66,73 +70,113 @@ class BotConfig:
     limit_price_offset_pct: float | None = 0.002
     extended_hours: bool | None = True
 
-    # ========================================================================
-    # STRATEGY IMPROVEMENTS (from improvement proposal)
-    # ========================================================================
+    # =========================================================================
+    # STRATEGY IMPROVEMENTS - All configurable
+    # =========================================================================
 
-    # --- Indicator Periods ---
-    rsi_period: int = 14
-    volume_period: int = 20
-    atr_period: int = 14
-
-    # --- Adaptive Volume Filter (Improvement #1) ---
+    # --- Adaptive Volume Filter ---
     use_adaptive_volume: bool = True
-    volume_ratio_pre_market: float = 1.2       # Before 10:30 AM
-    volume_ratio_regular_hours: float = 0.6    # After 10:30 AM
-    minimum_volume_multiplier: float = 1.25    # Fallback when adaptive disabled
+    volume_ratio_pre_market: float = 1.2       # Before 10:30 AM ET
+    volume_ratio_regular_hours: float = 0.8    # After 10:30 AM ET (increased from 0.6)
+    minimum_volume_multiplier: float = 1.0     # Fallback when adaptive disabled
 
-    # --- Shorter Breakout Lookback (Improvement #2) ---
-    # lookback_minutes already defined above (default 60)
-
-    # --- ATR-Based Breakout (Improvement #3) ---
+    # --- ATR-Based Breakout ---
     use_atr_breakout: bool = True
-    atr_breakout_multiplier: float = 0.5          # price > high - (0.5 * ATR)
-    atr_breakout_buffer: float = 0.5              # alias for atr_breakout_multiplier (used in breakout calc)
+    atr_breakout_multiplier: float = 0.75      # Price > high - (0.75 * ATR) (increased from 0.5)
+    require_confirmed_breakout: bool = True    # Require candle CLOSE above breakout level
 
-    # --- Pullback Entries (Improvement #4) ---
+    # --- Pullback Entries ---
     use_pullback_entry: bool = True
     pullback_tolerance_pct: float = 0.002      # Price within 0.2% of fast SMA
-    pullback_rsi_threshold: float = 50.0       # RSI > 50 for pullback
+    pullback_rsi_threshold: float = 58.0       # RSI > 58 for pullback (increased from 50)
 
-    # --- VWAP Continuation Entry (Improvement #5) ---
+    # --- VWAP Continuation Entry ---
     use_vwap_continuation_entry: bool = True
-    vwap_rsi_threshold: float = 55.0           # RSI > 55
-    vwap_volume_threshold: float = 0.6         # Volume ratio > 0.6
+    vwap_rsi_threshold: float = 60.0           # RSI > 60 (increased from 55)
+    vwap_volume_threshold: float = 0.8         # Volume ratio > 0.8 (increased from 0.6)
 
-    # --- Faster SMAs (Improvement #6) ---
-    # fast_sma_period and slow_sma_period already defined above (8/21)
-
-    # --- ATR-Based Stops (Improvement #7) ---
+    # --- ATR-Based Stops ---
     use_atr_stops: bool = True
-    atr_stop_loss_multiplier: float = 2.0
-    atr_take_profit_multiplier: float = 4.0
-    atr_trail_stop_multiplier: float = 1.5
+    atr_stop_loss_multiplier: float = 1.5      # Stop = entry - 1.5 * ATR (was 2.0)
+    atr_take_profit_multiplier: float = 3.0    # Target = entry + 3.0 * ATR (was 4.0)
+    atr_trail_stop_multiplier: float = 2.0     # Trail = 2.0 * ATR (was 1.5)
+    use_dynamic_targets: bool = True           # Allow larger targets when ADX > 35
 
-    # --- Multi-Timeframe Confirmation (Improvement #8) ---
+    # --- Multi-Timeframe Confirmation ---
     use_multi_timeframe: bool = True
     trend_timeframe: str = "5Min"
     trend_sma_period: int = 50
+    use_secondary_timeframe: bool = True       # 15Min confirmation
+    secondary_trend_timeframe: str = "15Min"
+    secondary_trend_sma_period: int = 50
 
     # --- Entry Strategy Toggles ---
     use_breakout_entry: bool = True
 
-    # --- Logging & Reporting (Improvement #9) ---
+    # --- Low Volatility Filter ---
+    use_low_vol_filter: bool = True
+    low_vol_atr_ratio: float = 0.8             # Skip if current ATR < 0.8 * avg ATR
+
+    # --- Lunch Hours Filter ---
+    use_lunch_filter: bool = True
+    lunch_start: str = "11:30"                 # ET
+    lunch_end: str = "13:00"                   # ET
+
+    # --- Market Open Delay ---
+    use_market_open_delay: bool = True
+    market_open_delay_minutes: int = 15        # Skip first 15 min after open
+
+    # --- ATR Position Sizing ---
+    use_atr_position_sizing: bool = False      # True = risk-based, False = fixed notional
+    risk_per_trade_usd: float = 10.0           # Risk $10 per trade (when ATR sizing enabled)
+
+    # --- Data Feed Preference ---
+    prefer_sip_feed: bool = False              # Use SIP feed if available (requires subscription)
+
+    # --- ADX Trend Filter ---
+    use_adx_filter: bool = True
+    adx_period: int = 14
+    adx_threshold: float = 25.0                # ADX > 25 for trend
+    adx_strong_threshold: float = 35.0         # ADX > 35 for strong trend (dynamic targets)
+
+    # --- Market Regime Filter ---
+    use_market_regime_filter: bool = True
+    regime_spy_symbol: str = "SPY"
+    regime_qqq_symbol: str = "QQQ"
+    regime_spy_ema_200: int = 200
+    regime_spy_ema_20: int = 20
+    regime_spy_ema_50: int = 50
+    regime_qqq_vwap_check: bool = True
+    regime_qqq_sma_8: int = 8
+    regime_qqq_sma_21: int = 21
+
+    # --- Logging & Reporting ---
+    require_previous_day_uptrend: bool = True
     log_strategy_details: bool = True
     log_skipped_signals: bool = True
     export_trades_csv: bool = True
-    require_previous_day_uptrend: bool = True
 
-    # additional test-only fields
-    stock_feed: str | None = None
-    stock_adjustment: str | None = None
-    limit_price_offset_pct: float | None = None
-    extended_hours: bool | None = None
+    # --- Telegram Notifications ---
+    telegram_enabled: bool = False
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
 
     @classmethod
     def load(cls, config_path: Path) -> "BotConfig":
+        logger = logging.getLogger("trend_bot")
         data: dict[str, Any] = {}
         if config_path.exists():
             data = json.loads(config_path.read_text(encoding="utf-8"))
+
+        # Surface typos silently dropped by the field filter (e.g. the shipped
+        # 'regimes_spy_ema_50' that never matched 'regime_spy_ema_50').
+        unknown = [key for key in data if key not in cls.__dataclass_fields__]
+        if unknown:
+            logger.warning(
+                "Ignoring unrecognized config.json key(s): %s (typo?)",
+                ", ".join(sorted(unknown)),
+            )
+
         cfg_kwargs = {key: value for key, value in data.items() if key in cls.__dataclass_fields__}
         # default symbols if not provided
         if "symbols" not in cfg_kwargs or cfg_kwargs.get("symbols") is None:
@@ -141,7 +185,27 @@ class BotConfig:
             else:
                 cfg_kwargs["symbols"] = ["QQQ", "SPY", "IWM", "SCHD", "BND"]
         cfg = cls(**cfg_kwargs)
-        return cfg.with_env_overrides()
+        cfg = cfg.with_env_overrides()
+        cfg._validate()
+        return cfg
+
+    def _validate(self) -> None:
+        if self.notional_usd is None or self.notional_usd <= 0:
+            raise ValueError(f"notional_usd must be > 0, got {self.notional_usd!r}")
+        if not self.symbols:
+            raise ValueError("symbols must be a non-empty list")
+        if self.poll_seconds is not None and self.poll_seconds < 1:
+            raise ValueError(f"poll_seconds must be >= 1, got {self.poll_seconds!r}")
+        for name in ("stop_loss_pct", "take_profit_pct", "trail_stop_pct"):
+            val = getattr(self, name)
+            if val is not None and val <= 0:
+                raise ValueError(f"{name} must be > 0, got {val!r}")
+        if self.max_daily_trades is not None and self.max_daily_trades < 1:
+            raise ValueError(f"max_daily_trades must be >= 1, got {self.max_daily_trades!r}")
+
+    @property
+    def trading_base_url(self) -> str:
+        return "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
 
     def with_env_overrides(self) -> "BotConfig":
         values = self.__dict__.copy()
@@ -152,6 +216,8 @@ class BotConfig:
             "TREND_BOT_PAPER": ("paper", bool),
             "TREND_BOT_NOTIONAL_USD": ("notional_usd", float),
             "TREND_BOT_POLL_SECONDS": ("poll_seconds", int),
+            "TELEGRAM_BOT_TOKEN": ("telegram_bot_token", str),
+            "TELEGRAM_CHAT_ID": ("telegram_chat_id", str),
         }
         for env_name, (field_name, caster) in env_map.items():
             raw = os.getenv(env_name)
@@ -170,3 +236,10 @@ class BotConfig:
     @property
     def data_base_url(self) -> str:
         return "https://data.alpaca.markets"
+
+    # Convenience: get the effective data feed to use
+    @property
+    def effective_stock_feed(self) -> str:
+        if self.prefer_sip_feed:
+            return "sip"
+        return self.stock_feed or "iex"

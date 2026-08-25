@@ -43,7 +43,7 @@ During the trading window, it looks for a long trend setup:
 
 It exits on a stop loss, take profit, trailing stop, moving-average trend break, or when the trading window closes if `exit_when_window_closes` is enabled.
 
-For stocks and ETFs, the bot sends limit orders with `extended_hours` enabled. That is more compatible with your 6:00 AM to 1:00 AM window than regular market-only orders, but the asset still has to be eligible and liquid enough for the order to fill.
+For stocks and ETFs, the bot places market orders (`src/alpaca_client.py`) within the extended-hours window. Market orders fill immediately but are subject to slippage; entry and exit P&L is computed from the broker's fill price when reported, falling back to the latest bar close.
 
 ## Setup
 
@@ -78,7 +78,7 @@ If you see `401 Unauthorized`, Alpaca rejected the key and secret being sent to 
 ```sh
 cd /Users/vaughnhuey/Documents/trading
 set -a; source .env; set +a
-python3 src/trend_bot.py --config config.json --check-credentials
+python3 -m src.bot --config config.json
 ```
 
 If that fails, regenerate your Alpaca paper trading API key and secret, then update `.env`.

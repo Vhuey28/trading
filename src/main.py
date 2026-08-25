@@ -18,6 +18,11 @@ def format_currency(value: float) -> str:
 def _make_bot_for_symbol(config: BotConfig, root: Path, symbol: str) -> TrendBot:
     cfg_kwargs = {k: getattr(config, k) for k in config.__dataclass_fields__.keys()}
     cfg_kwargs["symbol"] = symbol
+    # CRITICAL: each per-symbol bot must trade ONLY its own symbol. Without this,
+    # every thread would iterate the full `symbols` list and place Nx duplicate /
+    # conflicting orders across threads. Prefer the single-bot path (python -m
+    # src.bot) for production; see README.
+    cfg_kwargs["symbols"] = [symbol]
     cfg_kwargs["state_file"] = f"state/{symbol}_state.json"
     sym_cfg = BotConfig(**cfg_kwargs)
     return TrendBot(sym_cfg, root)

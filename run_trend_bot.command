@@ -4,9 +4,12 @@ set -euo pipefail
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BOT_DIR"
 
+# Shell-sourcing is a convenience; python-dotenv also loads .env at import, so a
+# malformed .env here must NOT prevent the bot from starting. source fails
+# softly and the Python loader fills the environment instead.
 if [[ -f "$BOT_DIR/.env" ]]; then
   set -a
-  source "$BOT_DIR/.env"
+  source "$BOT_DIR/.env" 2>/dev/null || true
   set +a
 fi
 
@@ -22,4 +25,4 @@ else
   exit 1
 fi
 
-exec "$PYTHON_BIN" "$BOT_DIR/src/bot.py" --config "$BOT_DIR/config.json"
+exec "$PYTHON_BIN" -m src.bot --config "$BOT_DIR/config.json"

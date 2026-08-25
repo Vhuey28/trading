@@ -28,15 +28,15 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Bootstrap sys.path so local modules resolve (same trick as trend_bot.py)
 # ---------------------------------------------------------------------------
-_SRC = Path(__file__).resolve().parent
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+_ROOT = Path(__file__).resolve().parent.parent  # project root (parent of src/)
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-from config import BotConfig
-from indicators import compute_previous_day_levels
-from models import Bar, PreviousDayLevels, TradeSignal
-from strategy import build_signal
-from utils import parse_alpaca_timestamp, previous_data_day
+from src.config import BotConfig
+from src.indicators import compute_previous_day_levels, atr, adx, sma
+from src.models import Bar
+from src.strategy import build_signal
+from src.utils import parse_alpaca_timestamp, previous_data_day
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -150,13 +150,30 @@ class BacktestTrade:
     pnl:         float = 0.0
     pnl_pct:     float = 0.0
 
+    # Enhanced analytics fields (captured at entry/exit)
+    qty:              float = 0.0
+    entry_type:       str = ""
+    fast_sma_at_entry: float = 0.0
+    slow_sma_at_entry: float = 0.0
+    atr_at_entry:     float = 0.0
+    adx_at_entry:     float = 0.0
+    notional:         float = 0.0  # effective size, mirrors live ATR position sizing
+    regime_spy_ema_200: float = 0.0
+    regime_spy_ema_20_50: float = 0.0
+    regime_qqq_vwap:   float = 0.0
+    regime_qqq_sma_8_21: float = 0.0
+    trade_duration_min: float = 0.0
+    mae:              float = float('inf')  # maximum adverse excursion (most negative)
+    mfe:              float = float('-inf')  # maximum favorable excursion (most positive)
+
     def close(self, exit_time: datetime, exit_price: float, reason: str, notional: float) -> None:
         self.exit_time   = exit_time
         self.exit_price  = exit_price
         self.exit_reason = reason
-        qty           = notional / self.entry_price
-        self.pnl      = (exit_price - self.entry_price) * qty
-        self.pnl_pct  = (exit_price / self.entry_price - 1.0) * 100.0
+        self.qty         = notional / self.entry_price
+        self.pnl         = (exit_price - self.entry_price) * self.qty
+        self.pnl_pct     = (exit_price / self.entry_price - 1.0) * 100.0
+        self.trade_duration_min = (exit_time - self.entry_time).total_seconds() / 60.0
 
 
 @dataclass
@@ -362,36 +379,90 @@ def backtest_symbol(
         for i in range(config.slow_sma_period, len(cur_bars) + 1):
             window      = cur_bars[:i]
             current_bar = cur_bars[i - 1]
-
-            if global_state["trade_count"] >= config.max_daily_trades:
-                break
+            ts          = current_bar.timestamp
 
             signal = build_signal(levels, window, sym_state, config)
             if signal is None:
+                # Track MAE/MFE while in position (even if no signal)
+                if sym_state["in_position"] and open_trade:
+                    entry = open_trade.entry_price
+                    current = current_bar.close
+                    pct_move = (current - entry) / entry * 100.0
+                    if pct_move < open_trade.mae:
+                        open_trade.mae = pct_move
+                    if pct_move > open_trade.mfe:
+                        open_trade.mfe = pct_move
                 continue
 
-            ts = current_bar.timestamp
+            # Track MAE/MFE before checking exit signals
+            if sym_state["in_position"] and open_trade:
+                entry = open_trade.entry_price
+                current = current_bar.close
+                pct_move = (current - entry) / entry * 100.0
+                if pct_move < open_trade.mae:
+                    open_trade.mae = pct_move
+                if pct_move > open_trade.mfe:
+                    open_trade.mfe = pct_move
 
             if signal.action == "buy" and not sym_state["in_position"]:
+                # Cooldown: mirror live can_trade_now (skip buys too soon after
+                # the previous trade, so the backtest doesn't over-trade).
+                if sym_state.get("last_trade_at") is not None:
+                    elapsed = (ts - sym_state["last_trade_at"]).total_seconds() / 60.0
+                    if elapsed < config.min_minutes_between_trades:
+                        continue
+                # Daily cap: same as live, only BUYS are gated by max_daily_trades
+                # (sells still close positions); also mirrors live's buy+sell count.
+                if global_state["trade_count"] >= config.max_daily_trades:
+                    continue
+
+                # Compute indicators at entry for enhanced analytics and sizing
+                ordered = sorted(window, key=lambda b: b.timestamp)
+                closes = [bar.close for bar in ordered]
+                atr_val = atr(ordered, config.atr_period)
+                adx_val, _, _ = adx(ordered, config.adx_period)
+                fast_sma = sma(closes, config.fast_sma_period)
+                slow_sma = sma(closes, config.slow_sma_period)
+
+                # ATR position sizing, mirroring live execute_signal
+                entry_notional = config.notional_usd
+                if config.use_atr_position_sizing and atr_val is not None and atr_val > 0:
+                    stop_distance = config.atr_stop_loss_multiplier * atr_val
+                    if stop_distance > 0:
+                        entry_notional = config.risk_per_trade_usd / stop_distance * signal.price
+                        entry_notional = min(entry_notional, config.notional_usd)
+
+                # Determine entry type from signal.reason
+                entry_type = signal.reason
+
                 open_trade = BacktestTrade(
                     symbol=symbol,
                     entry_time=ts,
                     entry_price=signal.price,
+                    entry_type=entry_type,
+                    fast_sma_at_entry=fast_sma or 0.0,
+                    slow_sma_at_entry=slow_sma or 0.0,
+                    atr_at_entry=atr_val or 0.0,
+                    adx_at_entry=adx_val or 0.0,
                 )
+                open_trade.notional = entry_notional
                 sym_state["in_position"]             = True
                 sym_state["entry_price"]             = signal.price
                 sym_state["highest_price_since_entry"] = signal.price
+                sym_state["last_trade_at"]           = ts
                 global_state["trade_count"]         += 1
                 logger.debug("[%s] BUY  @ %8.4f  %s  (%s)",
                              symbol, signal.price, ts.strftime("%Y-%m-%d %H:%M"), signal.reason)
 
             elif signal.action == "sell" and sym_state["in_position"] and open_trade:
-                open_trade.close(ts, signal.price, signal.reason, config.notional_usd)
+                open_trade.close(ts, signal.price, signal.reason, open_trade.notional or config.notional_usd)
                 result.trades.append(open_trade)
                 open_trade = None
                 sym_state["in_position"]              = False
                 sym_state["entry_price"]              = None
                 sym_state["highest_price_since_entry"] = None
+                sym_state["last_trade_at"]            = ts
+                global_state["trade_count"]          += 1  # live counts sells too
                 last_t = result.trades[-1]
                 logger.debug("[%s] SELL @ %8.4f  %s  (%s)  pnl=$%.2f",
                              symbol, last_t.exit_price, ts.strftime("%Y-%m-%d %H:%M"),
@@ -402,7 +473,7 @@ def backtest_symbol(
             last_bar = cur_bars[-1]
             open_trade.close(
                 last_bar.timestamp, last_bar.close,
-                "end-of-day close", config.notional_usd,
+                "end-of-day close", open_trade.notional or config.notional_usd,
             )
             result.trades.append(open_trade)
             open_trade = None
@@ -417,7 +488,7 @@ def backtest_symbol(
 # ── CSV export ────────────────────────────────────────────────────────────────
 
 def export_trades_csv(results: list[SymbolResult], config: BotConfig, root_dir: Path) -> Path:
-    """Export all trades to CSV file"""
+    """Export all trades to CSV file with enhanced analytics columns"""
     csv_path = root_dir / config.trades_csv_path
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -433,7 +504,11 @@ def export_trades_csv(results: list[SymbolResult], config: BotConfig, root_dir: 
         writer = csv.writer(f)
         writer.writerow([
             "symbol", "entry_time", "exit_time", "entry_price", "exit_price",
-            "pnl", "pnl_pct", "exit_reason", "notional_usd"
+            "pnl", "pnl_pct", "exit_reason", "notional_usd", "qty",
+            "entry_type", "fast_sma", "slow_sma", "atr_at_entry",
+            "adx_at_entry", "regime_spy_ema_200", "regime_spy_ema_20_50",
+            "regime_qqq_vwap", "regime_qqq_sma_8_21",
+            "trade_duration_min", "mae", "mfe",
         ])
         for t in all_trades:
             writer.writerow([
@@ -446,6 +521,19 @@ def export_trades_csv(results: list[SymbolResult], config: BotConfig, root_dir: 
                 t.pnl_pct,
                 t.exit_reason,
                 config.notional_usd,
+                t.qty,
+                t.entry_type,
+                t.fast_sma_at_entry,
+                t.slow_sma_at_entry,
+                t.atr_at_entry,
+                t.adx_at_entry,
+                t.regime_spy_ema_200,
+                t.regime_spy_ema_20_50,
+                t.regime_qqq_vwap,
+                t.regime_qqq_sma_8_21,
+                t.trade_duration_min,
+                t.mae,
+                t.mfe,
             ])
 
     return csv_path

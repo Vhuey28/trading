@@ -109,6 +109,14 @@ class StrategyTests(unittest.TestCase):
             volume_period=3,
             atr_period=3,
             rsi_period=3,
+            # Disable incidental filters so this test isolates breakout + MA
+            # alignment. The fixture bars are stamped 12:00 UTC, which the
+            # time-of-day filters would otherwise (wrongly) treat as ET lunch.
+            use_lunch_filter=False,
+            use_market_open_delay=False,
+            use_low_vol_filter=False,
+            use_adx_filter=False,
+            use_market_regime_filter=False,
         )
         previous = compute_previous_day_levels(date(2026, 7, 1), self.make_bars([100, 101, 102, 103, 104]))
         recent = self.make_bars([103, 104, 105, 106, 107])

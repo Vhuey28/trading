@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import os
 from dotenv import load_dotenv
-from models import Bar
-from utils import parse_alpaca_timestamp
+from src.models import Bar
+from src.utils import parse_alpaca_timestamp
 from datetime import datetime, timezone
 
 
@@ -52,6 +53,14 @@ class AlpacaClient:
             headers["Content-Type"] = "application/json"
 
         self.logger.debug("Alpaca API request: %s %s", method, url)
+
+        # Only non-idempotent writes (order POSTs / DELETE closes) are unsafe to
+        # auto-retry: if Alpaca applied the first attempt but the response was
+        # lost, retrying submits a second identical order. So we retry solely on
+        # safe, repeatable reads (GET/HEAD). Order placement relies on the
+        # broker-side client_order_id for idempotency instead of telemetry retry.
+        idempotent = method in {"GET", "HEAD"}
+
         for attempt in range(1, 4):
             request = Request(url, data=data, method=method, headers=headers)
             try:
@@ -72,7 +81,7 @@ class AlpacaClient:
                     exc.code,
                     detail,
                 )
-                if exc.code in {429, 500, 502, 503, 504} and attempt < 3:
+                if idempotent and exc.code in {429, 500, 502, 503, 504} and attempt < 3:
                     sleep_for = attempt * 2
                     self.logger.warning(
                         "Alpaca returned %s; retrying in %ss (attempt %d/3)",
@@ -90,7 +99,7 @@ class AlpacaClient:
                     url,
                     exc,
                 )
-                if attempt < 3:
+                if idempotent and attempt < 3:
                     sleep_for = attempt * 2
                     self.logger.warning("Retrying in %ss (attempt %d/3)", sleep_for, attempt)
                     time.sleep(sleep_for)
@@ -278,41 +287,56 @@ class AlpacaClient:
     def is_market_open_extended(self) -> bool:
         """
         Check if the market is currently open for trading including extended hours.
-        Alpaca's clock API only returns is_open for regular hours, so we check
-        if current time is between next_open and next_close (which include extended hours).
+        Alpaca's clock API returns is_open for regular hours only. For extended hours,
+        we check if current time is within the extended session (next_open to next_close).
         """
         from datetime import datetime, timezone
         clock = self.get_clock()
         if not clock:
             return False
 
+        # If regular market is open, extended is definitely open
+        if clock.get("is_open"):
+            return True
+
+        # Otherwise check if we're in extended hours (pre-market or after-hours)
         now = datetime.now(timezone.utc)
+        timestamp_str = clock.get("timestamp")
         next_open_str = clock.get("next_open")
         next_close_str = clock.get("next_close")
-        timestamp_str = clock.get("timestamp")
 
         if not next_open_str or not next_close_str or not timestamp_str:
             self.logger.debug("Clock missing next_open/next_close/timestamp; falling back to is_open")
-            return bool(clock.get("is_open"))
+            return False
 
         try:
-            # Parse timestamps (they come in ISO format with Z or +00:00)
+            # Use Alpaca's server timestamp to avoid clock skew
+            server_time = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
             next_open = datetime.fromisoformat(next_open_str.replace("Z", "+00:00"))
             next_close = datetime.fromisoformat(next_close_str.replace("Z", "+00:00"))
-            # Check if current time is between next_open and next_close
-            return next_open <= now <= next_close
+
+            # When market is closed (is_open=false), next_open/next_close refer to the
+            # current/next extended session. Check if server time is within that session.
+            return next_open <= server_time <= next_close
         except Exception as e:
             self.logger.warning("Failed to parse clock times: %s", e)
-            return bool(clock.get("is_open"))
+            return False
 
-    def place_market_buy(self, symbol: str, notional_usd: float):
+    def place_market_buy(self, symbol: str, notional_usd: float, client_order_id: str | None = None):
         body = {
             "symbol": symbol,
             "side": "buy",
             "type": "market",
-            "time_in_force": "gtc",
+            "time_in_force": "day",
             "notional": f"{notional_usd:.2f}",
         }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        else:
+            # Stable idempotency key: Alpaca will not execute a second order
+            # bearing the same client_order_id, so a lost-but-filled response
+            # cannot result in a duplicate entry.
+            body["client_order_id"] = uuid.uuid4().hex
         url = f"{self.config.trading_base_url}/v2/orders"
         payload = self.request_json("POST", url, body=body)
         return payload if isinstance(payload, dict) else None

@@ -1,4 +1,7 @@
 .env
+fix_live_bars_issue_prompt.md
+telegram.md
+Trading_Bot_Improvement_Proposal.md
 config.local.json
 data/*.csv
 logs/*.log

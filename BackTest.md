@@ -9,7 +9,7 @@
 
 ##    # Test specific symbols
 ```py
-    python src/backtest.py --start 2026-07-01 --end 2026-07-10 --symbols QQQ SPY IWM
+    python src/backtest.py --start 2026-07-01 --end 2026-07-10 --symbols QQQ SPY IWM SCHD BND
   ```
 
 ##    # Auto-download missing days from Alpaca, then test
@@ -21,3 +21,7 @@
 ```py
     python src/backtest.py --start 2026-07-01 --end 2026-07-10 --verbose
  ```   
+
+ # Restart the service
+  launchctl unload ~/Library/LaunchAgents/com.vaughnhuey.trend-bot.plist
+  launchctl load ~/Library/LaunchAgents/com.vaughnhuey.trend-bot.plist

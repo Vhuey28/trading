@@ -12,7 +12,7 @@
   "trade_window_end": "01:00",
 
   "paper": true,
-  "dry_run": true,
+  "dry_run": false,
 
   "notional_usd": 25.0,
 
@@ -33,7 +33,7 @@
   "trades_csv_path": "logs/trades.csv",
   "archive_dir": "archive",
 
-  "max_daily_trades": 10,
+  "max_daily_trades": 999,
   "min_minutes_between_trades": 15,
 
   "fast_sma_period": 8,
@@ -53,11 +53,12 @@
   "log_strategy_details": true,
   "log_skipped_signals": true,
   "export_trades_csv": true,
-  "minimum_volume_multiplier": 1.25,
 
   "rsi_period": 14,
   "volume_period": 20,
   "atr_period": 14,
+
+  "minimum_volume_multiplier": 0.6,
 
   "use_adaptive_volume": true,
   "volume_ratio_pre_market": 1.2,
@@ -70,7 +71,7 @@
   "pullback_tolerance_pct": 0.002,
   "pullback_rsi_threshold": 50.0,
 
-  "use_vwap_continuation_entry": true,
+  "use_vwap_continuation_entry": false,
   "vwap_rsi_threshold": 55.0,
   "vwap_volume_threshold": 0.6,
 
@@ -78,10 +79,47 @@
   "atr_stop_loss_multiplier": 2.0,
   "atr_take_profit_multiplier": 4.0,
   "atr_trail_stop_multiplier": 1.5,
+  "use_dynamic_targets": true,
 
   "use_multi_timeframe": true,
   "trend_timeframe": "5Min",
   "trend_sma_period": 50,
+  "use_secondary_timeframe": false,
+  "secondary_trend_timeframe": "15Min",
+  "secondary_trend_sma_period": 50,
 
-  "use_breakout_entry": true
+  "use_breakout_entry": true,
+
+  "use_low_vol_filter": false,
+  "low_vol_atr_ratio": 0.8,
+
+  "use_lunch_filter": false,
+  "lunch_start": "11:30",
+  "lunch_end": "13:00",
+
+  "use_market_open_delay": false,
+  "market_open_delay_minutes": 15,
+
+  "use_atr_position_sizing": false,
+  "risk_per_trade_usd": 10.0,
+
+  "prefer_sip_feed": false,
+
+  "use_adx_filter": false,
+  "adx_period": 14,
+  "adx_threshold": 20.0,
+  "adx_strong_threshold": 35.0,
+
+  "use_market_regime_filter": false,
+  "regime_spy_symbol": "SPY",
+  "regime_qqq_symbol": "QQQ",
+  "regime_spy_ema_200": 200,
+  "regime_spy_ema_20": 20,
+  "regime_spy_ema_50": 50,
+  "regime_qqq_vwap_check": true,
+  "regime_qqq_sma_8": 8,
+  "regime_qqq_sma_21": 21,
+
+  "require_confirmed_breakout": false,
+  "telegram_enabled": true
 }
