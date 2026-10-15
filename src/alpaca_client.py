@@ -73,7 +73,18 @@ class AlpacaClient:
             except HTTPError as exc:
                 if expected_404 and exc.code == 404:
                     return None
-                detail = exc.read().decode("utf-8", errors="replace")
+                try:
+                    raw_detail = exc.read()
+                except Exception:
+                    raw_detail = None
+                if isinstance(raw_detail, bytes):
+                    detail = raw_detail.decode("utf-8", errors="replace")
+                elif isinstance(raw_detail, str):
+                    detail = raw_detail
+                elif raw_detail is None:
+                    detail = str(exc.reason) if getattr(exc, "reason", None) else f"HTTP {exc.code}"
+                else:
+                    detail = str(raw_detail)
                 self.logger.warning(
                     "Alpaca API error: %s %s -> HTTP %s: %s",
                     method,
@@ -364,3 +375,34 @@ class AlpacaClient:
         url = f"{self.config.trading_base_url}/v2/positions/{encoded}"
         payload = self.request_json("DELETE", url, params={"percentage": "100"})
         return payload if isinstance(payload, dict) else None
+
+    def get_account(self) -> dict[str, Any] | None:
+        url = f"{self.config.trading_base_url}/v2/account"
+        payload = self.request_json("GET", url)
+        return payload if isinstance(payload, dict) else None
+
+    def get_account_equity(self) -> float | None:
+        acct = self.get_account()
+        if not acct:
+            return None
+        # Alpaca returns equity, last_equity, buying_power as strings
+        for key in ("equity", "last_equity", "portfolio_value", "cash"):
+            val = acct.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except Exception:
+                    continue
+        return None
+
+    def get_buying_power(self) -> float | None:
+        acct = self.get_account()
+        if not acct:
+            return None
+        val = acct.get("buying_power") or acct.get("cash")
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None

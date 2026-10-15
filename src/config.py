@@ -23,7 +23,29 @@ class BotConfig:
     trade_window_end: str = "01:00"
     paper: bool = True
     dry_run: bool = False
-    notional_usd: float = 25.0
+    notional_usd: float = 5000.0  # max-profit default: scales with account; use percent sizing to compound
+    # Max-profit position sizing
+    use_percent_position_sizing: bool = False  # if True, size = equity * percent_of_equity
+    percent_of_equity: float = 0.20  # 20% of equity per trade (very aggressive; compounds)
+    max_notional_usd: float = 20000.0  # hard cap per trade (margin-aware; raise with buying power)
+    use_compounding: bool = True  # percent sizing automatically compounds as equity grows
+    use_kelly_sizing: bool = False
+    kelly_win_rate: float = 0.45  # fallback priors for Kelly
+    kelly_avg_win: float = 0.037
+    kelly_avg_loss: float = 0.012
+    kelly_fraction: float = 0.25  # fractional Kelly (0.25 = quarter-Kelly)
+    use_pyramiding: bool = False  # add to winning positions
+    pyramid_add_pct: float = 0.5  # add 50% of initial size on trend continuation
+    # Daily loss guard (very aggressive: 15% daily)
+    max_daily_loss_pct: float = 0.15
+    max_daily_loss_usd: float | None = None  # absolute cap, overrides pct if set
+    use_daily_loss_halt: bool = True
+    # Conviction-based sizing
+    use_conviction_sizing: bool = True
+    conviction_adx_threshold: float = 35.0
+    conviction_volume_ratio: float = 1.5
+    conviction_multiplier: float = 1.5  # multiply size when high conviction
+    pullback_size_multiplier: float = 1.2  # pullback entries are higher win-rate (48% vs 33%)
 
     # Polling & Data
     poll_seconds: int = 15
@@ -127,8 +149,9 @@ class BotConfig:
     market_open_delay_minutes: int = 15        # Skip first 15 min after open
 
     # --- ATR Position Sizing ---
-    use_atr_position_sizing: bool = False      # True = risk-based, False = fixed notional
-    risk_per_trade_usd: float = 10.0           # Risk $10 per trade (when ATR sizing enabled)
+    use_atr_position_sizing: bool = True       # True = risk-based, False = fixed notional (max-profit: True)
+    risk_per_trade_usd: float = 150.0          # Risk $150 per trade (aggressive; capped by max_notional)
+    # When both percent and ATR sizing are enabled, percent takes precedence and ATR caps risk
 
     # --- Data Feed Preference ---
     prefer_sip_feed: bool = False              # Use SIP feed if available (requires subscription)
@@ -178,12 +201,12 @@ class BotConfig:
             )
 
         cfg_kwargs = {key: value for key, value in data.items() if key in cls.__dataclass_fields__}
-        # default symbols if not provided
+        # default symbols if not provided - max-profit momentum mix
         if "symbols" not in cfg_kwargs or cfg_kwargs.get("symbols") is None:
             if "symbol" in cfg_kwargs and cfg_kwargs["symbol"] is not None:
                 cfg_kwargs["symbols"] = [cfg_kwargs["symbol"]]
             else:
-                cfg_kwargs["symbols"] = ["QQQ", "SPY", "IWM", "SCHD", "BND"]
+                cfg_kwargs["symbols"] = ["QQQ", "SPY", "AAPL", "NVDA", "TSLA"]
         cfg = cls(**cfg_kwargs)
         cfg = cfg.with_env_overrides()
         cfg._validate()
@@ -202,10 +225,12 @@ class BotConfig:
                 raise ValueError(f"{name} must be > 0, got {val!r}")
         if self.max_daily_trades is not None and self.max_daily_trades < 1:
             raise ValueError(f"max_daily_trades must be >= 1, got {self.max_daily_trades!r}")
-
-    @property
-    def trading_base_url(self) -> str:
-        return "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+        if self.percent_of_equity is not None and not (0 < self.percent_of_equity <= 1.0):
+            raise ValueError(f"percent_of_equity must be (0,1], got {self.percent_of_equity!r}")
+        if self.max_notional_usd is not None and self.max_notional_usd <= 0:
+            raise ValueError(f"max_notional_usd must be > 0, got {self.max_notional_usd!r}")
+        if self.max_daily_loss_pct is not None and not (0 < self.max_daily_loss_pct <= 1.0):
+            raise ValueError(f"max_daily_loss_pct must be (0,1], got {self.max_daily_loss_pct!r}")
 
     def with_env_overrides(self) -> "BotConfig":
         values = self.__dict__.copy()

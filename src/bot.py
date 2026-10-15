@@ -566,11 +566,14 @@ class TrendBot:
         exit_price: float | None,
         pnl: float | None,
         pnl_pct: float | None,
-        indicators: dict[str, Any]
+        indicators: dict[str, Any],
+        notional: float | None = None,
     ) -> None:
         """Export trade to CSV for analysis"""
         if not self.config.export_trades_csv:
             return
+        # Use actual notional if provided, else fallback to config
+        export_notional = notional if notional is not None else self.config.notional_usd
 
         # Calculate additional analytics
         r_multiple = ""
@@ -615,7 +618,7 @@ class TrendBot:
                 exit_price if exit_price is not None else "",
                 pnl if pnl is not None else "",
                 pnl_pct if pnl_pct is not None else "",
-                self.config.notional_usd,
+                export_notional,
                 indicators.get("fast_sma", ""),
                 indicators.get("slow_sma", ""),
                 indicators.get("rsi", ""),
@@ -628,16 +631,101 @@ class TrendBot:
                 signal.reason if signal.action == "sell" else "",  # exit_reason
                 r_multiple,
                 indicators.get("atr", ""),
-                "",  # adx_at_entry - would need to pass from strategy
+                indicators.get("adx", "") or indicators.get("adx_at_entry", ""),  # adx_at_entry
                 indicators.get("session_vwap", ""),
                 indicators.get("volume_ratio", ""),
                 trade_duration_minutes,
                 hour_of_day,
                 day_of_week,
                 strategy,
-                self.config.notional_usd,  # position_size
+                export_notional,  # position_size actual
                 self.config.risk_per_trade_usd if self.config.use_atr_position_sizing else ""
             ])
+
+    def _calculate_notional(self, symbol: str, signal: TradeSignal, indicators: dict[str, Any] | None) -> tuple[float, str]:
+        """Max-profit position sizing: returns (notional, reason). Shared by dry_run and live."""
+        notional = self.config.notional_usd
+        base_reason = "fixed"
+        if signal.action != "buy":
+            return notional, base_reason
+        # 1) Percent-of-equity sizing (compounds as account grows) - user choice for max profit
+        if getattr(self.config, "use_percent_position_sizing", False):
+            equity = None
+            try:
+                if not self.config.dry_run:
+                    equity = self.client.get_account_equity()
+                if equity is None or equity <= 0:
+                    equity = self.config.notional_usd / max(0.01, self.config.percent_of_equity)
+            except Exception as e:
+                self.logger.debug("[%s] percent sizing equity fetch failed: %s", symbol, e)
+                equity = self.config.notional_usd / max(0.01, self.config.percent_of_equity)
+            if equity and equity > 0:
+                notional = float(equity) * float(self.config.percent_of_equity)
+                base_reason = f"percent {self.config.percent_of_equity*100:.0f}% of ${equity:,.0f}"
+        # 2) ATR risk-based sizing (scales inversely with volatility)
+        elif self.config.use_atr_position_sizing:
+            atr_val = indicators.get("atr") if indicators else None
+            if atr_val and atr_val > 0:
+                stop_distance = self.config.atr_stop_loss_multiplier * atr_val
+                if stop_distance > 0:
+                    notional = self.config.risk_per_trade_usd / stop_distance * signal.price
+                    base_reason = f"ATR risk ${self.config.risk_per_trade_usd} / {stop_distance:.2f} * price"
+        # Cap by max_notional
+        max_cap = getattr(self.config, "max_notional_usd", None) or self.config.notional_usd * 4
+        if max_cap and notional > max_cap:
+            notional = float(max_cap)
+            self.logger.info("[%s] Position cap: clamped notional to max $%.2f", symbol, max_cap)
+        if notional < self.config.notional_usd * 0.25:
+            notional = self.config.notional_usd * 0.5
+        # Conviction multipliers
+        conviction_mult = 1.0
+        if getattr(self.config, "use_conviction_sizing", False) and indicators:
+            if "pullback" in signal.reason.lower():
+                conviction_mult *= float(getattr(self.config, "pullback_size_multiplier", 1.2))
+            adx_val = indicators.get("adx")
+            if adx_val is None:
+                adx_val = indicators.get("adx_at_entry")
+            try:
+                adx_f = float(adx_val) if adx_val is not None else None
+                if adx_f is not None and adx_f >= float(self.config.conviction_adx_threshold):
+                    conviction_mult *= float(self.config.conviction_multiplier)
+            except Exception:
+                pass
+            vol_ratio = indicators.get("volume_ratio")
+            if vol_ratio is not None:
+                try:
+                    if float(vol_ratio) >= float(self.config.conviction_volume_ratio):
+                        conviction_mult *= 1.15
+                except Exception:
+                    pass
+        if conviction_mult != 1.0:
+            notional *= conviction_mult
+            if max_cap and notional > max_cap:
+                notional = float(max_cap)
+            base_reason += f" x conviction {conviction_mult:.2f} -> ${notional:.2f}"
+        if getattr(self.config, "use_kelly_sizing", False):
+            try:
+                p = float(self.config.kelly_win_rate)
+                b = float(self.config.kelly_avg_win) / max(1e-6, float(self.config.kelly_avg_loss))
+                q = 1.0 - p
+                kelly = (p * b - q) / b
+                kelly = max(0.0, kelly) * float(self.config.kelly_fraction)
+                if getattr(self.config, "use_percent_position_sizing", False):
+                    # estimate equity again
+                    eq = self.config.notional_usd / max(0.01, self.config.percent_of_equity)
+                    try:
+                        if not self.config.dry_run:
+                            eq2 = self.client.get_account_equity()
+                            if eq2 and eq2 > 0:
+                                eq = eq2
+                    except Exception:
+                        pass
+                    kelly_notional = float(eq) * kelly
+                    notional = max(notional, kelly_notional)
+                    base_reason += f" Kelly {kelly*100:.1f}% -> ${kelly_notional:.0f}"
+            except Exception as e:
+                self.logger.debug("Kelly calc failed: %s", e)
+        return float(notional), base_reason
 
     def execute_signal(self, symbol: str, signal: TradeSignal, state: dict[str, Any], indicators: dict[str, Any] | None = None) -> None:
         if signal.action == "buy" and not self.can_trade_now(state, symbol, datetime.now(self.tz)):
@@ -646,38 +734,38 @@ class TrendBot:
                 self.logger.info("[%s] SKIPPED BUY: %s (trade limits)", symbol, signal.reason)
             return
 
+        # Pre-calc notional for both dry_run and live (so dry_run logs realistic size)
+        notional_for_signal = self.config.notional_usd
+        sizing_reason = "fixed"
+        if signal.action == "buy":
+            notional_for_signal, sizing_reason = self._calculate_notional(symbol, signal, indicators or {})
+            self.logger.info("[%s] MAX-PROFIT sizing preview: %s => $%.2f (%.4f shares @ $%.2f) reason=%s",
+                             symbol, sizing_reason, notional_for_signal, notional_for_signal / max(0.01, signal.price), signal.price, signal.reason)
+
         if self.config.dry_run:
             self.logger.info(
-                "[%s] DRY RUN: would %s at %.8f because %s",
+                "[%s] DRY RUN: would %s at %.8f because %s (notional $%.2f, %.4f shares)",
                 symbol,
                 signal.action,
                 signal.price,
                 signal.reason,
+                notional_for_signal if signal.action == "buy" else 0,
+                notional_for_signal / max(0.01, signal.price) if signal.action == "buy" else 0,
             )
-            self.record_trade(state, symbol, signal, None)
-            # Export dry run trades too for analysis
+            self.record_trade(state, symbol, signal, None, notional_for_signal if signal.action == "buy" else None)
             if self.config.export_trades_csv and indicators:
                 self.export_trade_to_csv(
                     symbol, signal, None,
                     signal.price if signal.action == "buy" else None,
                     signal.price if signal.action == "sell" else None,
-                    None, None, indicators
+                    None, None, indicators,
+                    notional_for_signal if signal.action == "buy" else None,
                 )
             return
 
-        # Calculate position size (ATR-based or fixed notional)
-        notional = self.config.notional_usd
-        if signal.action == "buy" and self.config.use_atr_position_sizing:
-            atr_val = indicators.get("atr") if indicators else None
-            if atr_val and atr_val > 0:
-                stop_distance = self.config.atr_stop_loss_multiplier * atr_val
-                if stop_distance > 0:
-                    # Risk per trade = notional / stop_distance * price
-                    notional = self.config.risk_per_trade_usd / stop_distance * signal.price
-                    # Cap at configured notional
-                    notional = min(notional, self.config.notional_usd)
-                    self.logger.info("[%s] ATR position sizing: atr=%.4f, stop_dist=%.4f, notional=%.2f",
-                                     symbol, atr_val, stop_distance, notional)
+        # Use pre-calculated notional (already includes max-profit logic)
+        notional = notional_for_signal
+        base_reason = sizing_reason
 
         entry_price = None
         exit_price = None
@@ -720,22 +808,42 @@ class TrendBot:
             entry = symbol_state.get("entry_price")
             if entry:
                 entry = float(entry)
-                qty = symbol_state.get("entry_qty") or (notional / entry)
+                qty = symbol_state.get("entry_qty") or (self.config.notional_usd / entry)
+                # try to use order filled_qty if available
+                if isinstance(order, dict) and order.get("filled_qty"):
+                    try:
+                        qty = float(order["filled_qty"])
+                    except Exception:
+                        pass
                 pnl = (exit_price - entry) * float(qty)
                 pnl_pct = (exit_price / entry - 1.0) * 100.0
                 # Telegram notification
                 self.notifier.trade_closed(symbol, entry, exit_price, pnl, signal.reason)
+                # Update daily PnL for risk halt
+                try:
+                    today = datetime.now(self.tz).date().isoformat()
+                    if state.get("daily_pnl_day") != today:
+                        state["daily_pnl_day"] = today
+                        state["daily_pnl"] = 0.0
+                    state["daily_pnl"] = float(state.get("daily_pnl", 0.0)) + float(pnl)
+                except Exception:
+                    pass
         else:
             order = None
 
         self.logger.info("[%s] Placed %s order: %s", symbol, signal.action, order if order is not None else "NONE")
         self.record_trade(state, symbol, signal, order, notional)
+        # keep daily pnl persisted in state even on buys (0)
+        # ensure daily_pnl is initialized
+        if pnl is not None and state.get("daily_pnl") is None:
+            state["daily_pnl"] = float(pnl)
 
         # Export trade to CSV
         if self.config.export_trades_csv and indicators:
             self.export_trade_to_csv(
                 symbol, signal, order,
-                entry_price, exit_price, pnl, pnl_pct, indicators
+                entry_price, exit_price, pnl, pnl_pct, indicators,
+                notional,
             )
 
     def run_once(self, now: datetime | None = None) -> None:
@@ -756,10 +864,15 @@ class TrendBot:
 
         # Check market clock from Alpaca to know if market is actually open
         # (includes extended hours if configured)
-        if self.config.extended_hours:
-            market_open = self.client.is_market_open_extended()
-        else:
-            market_open = self.client.is_market_open()
+        # If credentials missing (dry_run dev without .env), assume market open to allow sizing preview.
+        try:
+            if self.config.extended_hours:
+                market_open = self.client.is_market_open_extended()
+            else:
+                market_open = self.client.is_market_open()
+        except Exception as e:
+            self.logger.warning("Market clock check failed (%s); assuming market OPEN for dry_run/preview.", e)
+            market_open = True
         self.logger.debug(
             "Market clock check: window_open=%s, market_open=%s, now=%s",
             window_open,
@@ -792,6 +905,39 @@ class TrendBot:
             self._send_hourly_notification(now, "Market closed (weekend/holiday); bot waiting.")
             self.save_state(state)
             return
+
+        # Daily loss halt - max-profit aggressive risk guard (15% daily)
+        # Track daily PnL aggregated from today's trades in state
+        today_str = now.date().isoformat()
+        if state.get("daily_pnl_day") != today_str:
+            state["daily_pnl_day"] = today_str
+            state["daily_pnl"] = 0.0
+        if getattr(self.config, "use_daily_loss_halt", False):
+            daily_pnl = float(state.get("daily_pnl", 0.0))
+            # Resolve max loss: absolute USD if set, else pct of equity (requires account fetch)
+            max_loss_usd = getattr(self.config, "max_daily_loss_usd", None)
+            if max_loss_usd is None:
+                pct = float(getattr(self.config, "max_daily_loss_pct", 0.15))
+                # estimate equity: try live fetch, else infer from notional/percent
+                equity_est = None
+                try:
+                    if not self.config.dry_run:
+                        equity_est = self.client.get_account_equity()
+                except Exception:
+                    equity_est = None
+                if equity_est and equity_est > 0:
+                    max_loss_usd = equity_est * pct
+                else:
+                    # fallback: 5x notional as rough equity (e.g., 5k notional -> 25k equity)
+                    fallback_equity = self.config.notional_usd / max(0.01, float(getattr(self.config, "percent_of_equity", 0.20)))
+                    max_loss_usd = fallback_equity * pct
+            if daily_pnl <= -abs(float(max_loss_usd)):
+                self.logger.warning("DAILY LOSS HALT active: PnL $%.2f <= -$%.2f max loss. Skipping new BUYs today.", daily_pnl, abs(max_loss_usd))
+                # allow sells to close positions, but block new buys
+                # we will continue loop but skip buy signals later via can_trade check
+                state["daily_halted"] = True
+            else:
+                state.pop("daily_halted", None)
 
         # Cache for storing previous bars to handle "no new bar yet" scenarios
         if not hasattr(self, "_bar_cache"):
@@ -853,12 +999,13 @@ class TrendBot:
             price = closes[-1] if closes else None
             current_bar = ordered[-1] if ordered else None
             current_time = current_bar.timestamp if current_bar else now
-            from src.indicators import sma, atr, rsi, avg_volume, vwap
+            from src.indicators import sma, atr, rsi, avg_volume, vwap, adx
 
             fast = sma(closes, self.config.fast_sma_period)
             slow = sma(closes, self.config.slow_sma_period)
             atr_val = atr(ordered, self.config.atr_period)
             rsi_val = rsi(closes, self.config.rsi_period)
+            adx_val, plus_di, minus_di = adx(ordered, self.config.adx_period)
             avg_vol = avg_volume(ordered, self.config.volume_period)
             vol_ratio = None
             last_vol = ordered[-1].volume if ordered else None
@@ -930,6 +1077,7 @@ class TrendBot:
                 lines.append(("✓ " if ok else "✗ ") + name)
             lines.append("")
 
+            # Daily halt: block new BUYs if halted, still allow SELLs to exit
             # Build signal with trend_bars for multi-timeframe and regime_data.
             # build_signal mutates the working copy, so afterwards we persist the
             # trailing high-water mark it ratcheted back onto the real state —
@@ -942,6 +1090,10 @@ class TrendBot:
             signal = build_signal(levels, recent_bars, symbol_state_with_mtf, self.config, regime_data)
             if symbol_state.get("in_position") and symbol_state_with_mtf.get("highest_price_since_entry") is not None:
                 symbol_state["highest_price_since_entry"] = symbol_state_with_mtf["highest_price_since_entry"]
+            # Enforce daily loss halt on buys
+            if signal and signal.action == "buy" and state.get("daily_halted"):
+                self.logger.warning("[%s] BUY blocked by daily loss halt (daily PnL %.2f)", symbol, float(state.get("daily_pnl", 0.0)))
+                signal = None
             if signal:
                 lines.append(f"{signal.action.title()} - {signal.reason}")
                 self.logger.info("\n" + "\n".join(lines) + "\n" + "=" * 41)
@@ -950,6 +1102,7 @@ class TrendBot:
                     "slow_sma": slow,
                     "rsi": rsi_val,
                     "atr": atr_val,
+                    "adx": adx_val,
                     "volume_ratio": vol_ratio,
                     "session_vwap": session_vwap,
                     "breakout_price": breakout_price,

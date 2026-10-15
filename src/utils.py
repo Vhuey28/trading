@@ -40,8 +40,13 @@ def _escape_apple_script_string(value: str) -> str:
 
 
 def send_macos_notification(title: str, message: str) -> None:
-    script = (
-        f'display notification "{_escape_apple_script_string(message)}"'
-        f' with title "{_escape_apple_script_string(title)}"'
-    )
-    subprocess.run(["osascript", "-e", script], check=False)
+    try:
+        script = (
+            f'display notification "{_escape_apple_script_string(message)}"'
+            f' with title "{_escape_apple_script_string(title)}"'
+        )
+        subprocess.run(["osascript", "-e", script], check=False)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
