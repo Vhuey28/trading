@@ -24,6 +24,40 @@ from src.utils import (
 )
 from src.models import Bar, PreviousDayLevels, TradeSignal
 
+# Hybrid Leaner imports (optional, graceful fallback if missing)
+try:
+    from src.storage import (
+        init_trades_db,
+        log_trade as storage_log_trade,
+        log_veto_replay,
+        write_bars_parquet,
+        rotate_parquet,
+        migrate_csv_to_db,
+    )
+    STORAGE_AVAILABLE = True
+except Exception:
+    STORAGE_AVAILABLE = False
+    init_trades_db = None  # type: ignore
+    storage_log_trade = None  # type: ignore
+    log_veto_replay = None  # type: ignore
+    write_bars_parquet = None  # type: ignore
+    rotate_parquet = None  # type: ignore
+    migrate_csv_to_db = None  # type: ignore
+
+try:
+    from src.learner import HybridLearner
+    LEARNER_AVAILABLE = True
+except Exception:
+    HybridLearner = None  # type: ignore
+    LEARNER_AVAILABLE = False
+
+try:
+    from src.scanner import OpenScanner
+    SCANNER_AVAILABLE = True
+except Exception:
+    OpenScanner = None  # type: ignore
+    SCANNER_AVAILABLE = False
+
 
 def symbol_file_stem(symbol: str) -> str:
     return symbol.replace("/", "_").replace(":", "_")
@@ -62,6 +96,49 @@ class TrendBot:
                 "IEX feed does NOT include extended hours data (pre-market/after-hours). "
                 "Consider using stock_feed='sip' (requires subscription) or set extended_hours=false."
             )
+
+        # Hybrid Leaner: storage + learner + scanner
+        self.storage_db_path = self.resolve_path(getattr(config, "storage_db_path", "logs/trades.db"))
+        self.parquet_root = self.resolve_path(getattr(config, "storage_parquet_root", "data/parquet"))
+        self.archive_root = self.resolve_path(getattr(config, "storage_archive_root", "archive/parquet"))
+        self.learner = None
+        self.scanner = None
+        self.last_learner_retrain_day: date | None = None
+        self.last_scanner_rank_day: date | None = None
+
+        # Init SQLite trades DB and migrate existing CSV if present (once)
+        if STORAGE_AVAILABLE and init_trades_db:
+            try:
+                init_trades_db(self.storage_db_path)
+                # One-time migration of existing trades.csv into DB for learner
+                csv_path = self.resolve_path(getattr(config, "trades_csv_path", "logs/trades.csv"))
+                if csv_path.exists() and migrate_csv_to_db:
+                    # Only migrate if DB empty
+                    import sqlite3
+                    with sqlite3.connect(self.storage_db_path) as conn:
+                        cnt = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+                    if cnt == 0:
+                        migrated = migrate_csv_to_db(csv_path, self.storage_db_path)
+                        if migrated:
+                            self.logger.info("Migrated %d trades from %s to %s for Hybrid Learner", migrated, csv_path, self.storage_db_path)
+            except Exception as e:
+                self.logger.warning("Storage init failed: %s", e)
+
+        # Init Hybrid Learner (Level 3 RL + Level 2 veto)
+        if getattr(config, "learner_enabled", False) and LEARNER_AVAILABLE and HybridLearner:
+            try:
+                self.learner = HybridLearner(db_path=self.storage_db_path, model_dir=self.resolve_path(getattr(config, "learner_model_dir", "models")), config=config)
+                self.logger.info("Hybrid Learner enabled: veto_threshold %.2f, model_dir %s", self.learner.veto_threshold, self.learner.model_dir)
+            except Exception as e:
+                self.logger.warning("Learner init failed: %s", e)
+
+        # Init Open Scanner
+        if getattr(config, "scanner_enabled", False) and SCANNER_AVAILABLE and OpenScanner:
+            try:
+                self.scanner = OpenScanner(config, self)
+                self.logger.info("Open Scanner enabled: watchlist %d symbols, top_n %d", len(self.scanner.watchlist), self.scanner.top_n)
+            except Exception as e:
+                self.logger.warning("Scanner init failed: %s", e)
 
     def resolve_path(self, value: str) -> Path:
         path = Path(value)
@@ -649,11 +726,12 @@ class TrendBot:
         if signal.action != "buy":
             return notional, base_reason
         # 1) Percent-of-equity sizing (compounds as account grows) - user choice for max profit
+        # Scales with actual buying power: 200k -> $40k, 1k -> $200 (floored)
         if getattr(self.config, "use_percent_position_sizing", False):
             equity = None
             try:
-                if not self.config.dry_run:
-                    equity = self.client.get_account_equity()
+                # Always try live equity, even in dry_run preview (so 1k test works)
+                equity = self.client.get_account_equity()
                 if equity is None or equity <= 0:
                     equity = self.config.notional_usd / max(0.01, self.config.percent_of_equity)
             except Exception as e:
@@ -675,8 +753,33 @@ class TrendBot:
         if max_cap and notional > max_cap:
             notional = float(max_cap)
             self.logger.info("[%s] Position cap: clamped notional to max $%.2f", symbol, max_cap)
-        if notional < self.config.notional_usd * 0.25:
-            notional = self.config.notional_usd * 0.5
+        # Floor: respect storage_min_notional ($200) for 1k equity; don't shrink percent-sized positions via 0.25 rule
+        min_floor = float(getattr(self.config, "storage_min_notional", 200.0))
+        if getattr(self.config, "use_percent_position_sizing", False):
+            if notional < min_floor:
+                notional = min_floor
+                base_reason += f" floored to ${min_floor:.0f}"
+        else:
+            if notional < min_floor:
+                notional = min_floor
+                base_reason += f" floored to ${min_floor:.0f}"
+            elif notional < self.config.notional_usd * 0.25:
+                notional = self.config.notional_usd * 0.5
+        # Hybrid Learner RL multiplier (Level 3) — stacked with conviction
+        if self.learner is not None and getattr(self.config, "learner_enabled", False):
+            try:
+                rl_mult, rl_reason = self.learner.get_rl_multiplier(symbol, indicators, signal.reason, signal.price, notional)
+                if rl_mult != 1.0:
+                    notional *= rl_mult
+                    if max_cap and notional > max_cap:
+                        notional = float(max_cap)
+                    # enforce min floor again
+                    if notional < min_floor:
+                        notional = min_floor
+                    base_reason += f" x RL {rl_mult:.2f} ({rl_reason}) -> ${notional:.0f}"
+                    self.logger.info("[%s] Hybrid RL sizing: %s", symbol, rl_reason)
+            except Exception as e:
+                self.logger.debug("[%s] RL sizing failed: %s", symbol, e)
         # Conviction multipliers
         conviction_mult = 1.0
         if getattr(self.config, "use_conviction_sizing", False) and indicators:
@@ -741,6 +844,56 @@ class TrendBot:
             notional_for_signal, sizing_reason = self._calculate_notional(symbol, signal, indicators or {})
             self.logger.info("[%s] MAX-PROFIT sizing preview: %s => $%.2f (%.4f shares @ $%.2f) reason=%s",
                              symbol, sizing_reason, notional_for_signal, notional_for_signal / max(0.01, signal.price), signal.price, signal.reason)
+            # Hybrid Learner VETO gate (Level 2) — block low win_prob buys
+            if self.learner is not None and getattr(self.config, "learner_enabled", False) and signal.action == "buy":
+                try:
+                    veto_res = self.learner.should_veto(symbol, indicators or {}, signal.reason, signal.price)
+                    indicators["veto_prob"] = veto_res.win_prob  # persist for logging
+                    indicators["veto_reason"] = veto_res.reason
+                    if veto_res.veto:
+                        self.logger.info("[%s] 🧠 LEARNER VETO: win_prob %.2f < %.2f (%s) — skipping BUY", symbol, veto_res.win_prob, self.learner.veto_threshold, veto_res.reason)
+                        # Log veto replay for nightly missed-winner analysis (storage lean: just DB)
+                        if STORAGE_AVAILABLE and log_veto_replay:
+                            try:
+                                log_veto_replay(self.storage_db_path, {
+                                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                                    "symbol": symbol,
+                                    "price": signal.price,
+                                    "reason": signal.reason,
+                                    "veto_prob": veto_res.win_prob,
+                                    "features_json": indicators,
+                                })
+                            except Exception:
+                                pass
+                        # Also export veto to CSV for audit
+                        if self.config.export_trades_csv:
+                            # mark as vetoed skip
+                            self.logger.debug("[%s] Vetoed signal logged", symbol)
+                        return
+                    else:
+                        self.logger.info("[%s] 🧠 Learner PASS: win_prob %.2f >= %.2f", symbol, veto_res.win_prob, self.learner.veto_threshold)
+                except Exception as e:
+                    self.logger.debug("[%s] Veto check failed: %s", symbol, e)
+            # Sandbox for new scanner symbols: first 5 trades at 50% size (10% equity)
+            if signal.action == "buy" and self.scanner is not None:
+                try:
+                    # Track counts in state
+                    sandbox_key = f"sandbox_count_{symbol}"
+                    # Check if this symbol was recently added via scanner (in last 5 trades, PF not yet proven)
+                    # Use trades.db PF check: if trades for symbol <5, apply sandbox
+                    import sqlite3
+                    if self.storage_db_path.exists():
+                        with sqlite3.connect(self.storage_db_path) as conn:
+                            cur = conn.execute("SELECT COUNT(*) FROM trades WHERE symbol=? AND pnl IS NOT NULL", (symbol,))
+                            cnt = cur.fetchone()[0]
+                            if cnt < 5:
+                                # sandbox: cap to 50% of normal
+                                orig = notional_for_signal
+                                notional_for_signal = max(float(getattr(self.config, "storage_min_notional", 200.0)), notional_for_signal * 0.5)
+                                sizing_reason += f" [SANDBOX first {cnt}/5 trades 50% -> ${notional_for_signal:.0f} (orig ${orig:.0f})]"
+                                self.logger.info("[%s] 🧪 Scanner sandbox: %s", symbol, sizing_reason)
+                except Exception:
+                    pass
 
         if self.config.dry_run:
             self.logger.info(
@@ -838,7 +991,42 @@ class TrendBot:
         if pnl is not None and state.get("daily_pnl") is None:
             state["daily_pnl"] = float(pnl)
 
-        # Export trade to CSV
+        # Hybrid storage: also log to SQLite trades.db for nightly learner (lean, survives CSV rotation)
+        if STORAGE_AVAILABLE and storage_log_trade:
+            try:
+                trade_for_db = {
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                    "symbol": symbol,
+                    "action": signal.action,
+                    "price": signal.price,
+                    "reason": signal.reason,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "notional": notional,
+                    "qty": (notional / max(1, signal.price)) if signal.action=="buy" else None,
+                    "fast_sma": indicators.get("fast_sma") if indicators else None,
+                    "slow_sma": indicators.get("slow_sma") if indicators else None,
+                    "rsi": indicators.get("rsi") if indicators else None,
+                    "atr": indicators.get("atr") if indicators else None,
+                    "adx": indicators.get("adx") if indicators else None,
+                    "volume_ratio": indicators.get("volume_ratio") if indicators else None,
+                    "session_vwap": indicators.get("session_vwap") if indicators else None,
+                    "breakout_price": indicators.get("breakout_price") if indicators else None,
+                    "entry_type": signal.reason,
+                    "trade_duration_min": None,
+                    "mae": None,
+                    "mfe": None,
+                    "veto_prob": indicators.get("veto_prob") if indicators else None,
+                    "rl_action": sizing_reason if 'sizing_reason' in locals() else None,
+                    "features_json": json.dumps(indicators) if indicators else None,
+                }
+                storage_log_trade(self.storage_db_path, trade_for_db)
+            except Exception as e:
+                self.logger.debug("Storage DB log failed: %s", e)
+
+        # Export trade to CSV (legacy, still for manual Excel view — will be gzipped weekly)
         if self.config.export_trades_csv and indicators:
             self.export_trade_to_csv(
                 symbol, signal, order,
@@ -855,6 +1043,13 @@ class TrendBot:
         state = self.load_state()
         state.setdefault("trade_count_day", now.date().isoformat())
         state.setdefault("trade_count", 0)
+        # Apply approved scanner symbols override if present (persists across restarts)
+        if "symbols_override" in state and isinstance(state["symbols_override"], list) and state["symbols_override"]:
+            try:
+                object.__setattr__(self.config, "symbols", state["symbols_override"])
+                self.logger.info("Using scanner-overridden symbols: %s", state["symbols_override"])
+            except Exception:
+                pass
 
         window_open = is_trade_window_open(
             now,
@@ -939,6 +1134,63 @@ class TrendBot:
             else:
                 state.pop("daily_halted", None)
 
+        # ==== Hybrid Leaner nightly tasks ====
+        # 1. Telegram approval poll for scanner rotations (every hour)
+        if self.scanner and getattr(self.config, "scanner_approval_required", True):
+            try:
+                # poll Telegram for /approve
+                if hasattr(self.notifier, "poll_approvals"):
+                    self.notifier.poll_approvals(self.scanner.pending_path)
+                approved = self.scanner.check_approval()
+                if approved:
+                    new_symbols = self.scanner.apply_approved_rotation(approved, list(self.config.symbols))
+                    # Update runtime config (will persist until next config reload)
+                    # We mutate config symbols via object.__setattr__ because frozen dataclass
+                    object.__setattr__(self.config, "symbols", new_symbols)
+                    self.logger.info("Scanner rotation applied via Telegram approval: %s", new_symbols)
+                    self.notifier.send_message(f"✅ Rotation applied: {new_symbols}")
+                    # persist to state for restart
+                    state["symbols_override"] = new_symbols
+            except Exception as e:
+                self.logger.debug("Scanner approval check failed: %s", e)
+
+        # 2. Scanner ranking at 07:00 ET (pre-market) — propose rotation if beneficial
+        try:
+            scanner_hour = int(getattr(self.config, "scanner_rank_cron_hour", 7))
+            local_hour = now.astimezone(self.tz).hour
+            if self.scanner and local_hour == scanner_hour and self.last_scanner_rank_day != now.date():
+                self.last_scanner_rank_day = now.date()
+                proposal = self.scanner.evaluate_rotation(list(self.config.symbols))
+                if proposal:
+                    self.scanner.propose_via_telegram(proposal)
+                else:
+                    self.logger.info("Scanner: no rotation needed (current symbols optimal)")
+        except Exception as e:
+            self.logger.debug("Scanner ranking failed: %s", e)
+
+        # 3. Learner nightly retrain at 22:00 ET (after close)
+        try:
+            retrain_hour = int(getattr(self.config, "learner_retrain_hour", 22))
+            local_hour = now.astimezone(self.tz).hour
+            if self.learner and local_hour == retrain_hour and self.last_learner_retrain_day != now.date():
+                self.last_learner_retrain_day = now.date()
+                self.logger.info("🧠 Hybrid Learner nightly retrain starting...")
+                report = self.learner.nightly_retrain()
+                self.logger.info("Learner retrain report: %s", report)
+                self.notifier.send_message(f"🧠 Learner retrain: {json.dumps(report, indent=2)[:800]}")
+                # After retrain, rotate parquet (storage lean)
+                if STORAGE_AVAILABLE and rotate_parquet:
+                    try:
+                        stats = rotate_parquet(self.parquet_root, self.archive_root, keep_days=int(getattr(self.config, "storage_keep_days", 30)), gzipped_archive=bool(getattr(self.config, "storage_gzipped_archive", True)))
+                        self.logger.info("Storage rotation: %s", stats)
+                    except Exception as rot_e:
+                        self.logger.warning("Storage rotation failed: %s", rot_e)
+        except Exception as e:
+            self.logger.warning("Learner retrain failed: %s", e)
+
+        # 4. Check for gzipped external drive export request (if archive requested via state)
+        # External drive export is manual: run scripts/export_parquet.py or set state flag
+
         # Cache for storing previous bars to handle "no new bar yet" scenarios
         if not hasattr(self, "_bar_cache"):
             self._bar_cache = {}
@@ -979,6 +1231,13 @@ class TrendBot:
             else:
                 # Update cache with successful fetch
                 self._bar_cache[symbol] = recent_bars
+                # Hybrid storage: write to parquet (lean, gzipped, 30-day rotation) for learner replay + external drive
+                if STORAGE_AVAILABLE and write_bars_parquet:
+                    try:
+                        day_key = now.astimezone(self.tz).date()
+                        write_bars_parquet(self.parquet_root, symbol, day_key, recent_bars)
+                    except Exception as pe:
+                        self.logger.debug("[%s] Parquet write failed: %s", symbol, pe)
 
             if not recent_bars:
                 self.logger.warning("[%s] No bars available (live or cached); skipping", symbol)

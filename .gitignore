@@ -3,9 +3,15 @@ fix_live_bars_issue_prompt.md
 telegram.md
 Trading_Bot_Improvement_Proposal.md
 config.local.json
-data/*.csv
+data/
+archive/
+archive_external/
 logs/*.log
+logs/trades.db
 state/*.json
+models/*.pkl
+models/*.json
 __pycache__/
 *.pyc
+Unselected files/
 

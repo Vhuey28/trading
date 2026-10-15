@@ -54,6 +54,8 @@ def make_bot(tmp: Path, buy_result=None, close_result=None) -> TrendBot:
         trades_csv_path=str(tmp / "trades.csv"),
         telegram_enabled=False,
         export_trades_csv=False,
+        learner_enabled=False,
+        scanner_enabled=False,
     )
     bot = TrendBot(config, tmp)
     bot.client = FakeClient(buy_result=buy_result, close_result=close_result)

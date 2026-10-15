@@ -184,6 +184,33 @@ class BotConfig:
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
+    # =========================================================================
+    # HYBRID LEANER — Storage, Learner, Scanner (Level 3 RL + Level 2 Veto)
+    # =========================================================================
+
+    # --- Storage: SQLite trades + Parquet bars with 30-day rotation + gzipped archive ---
+    storage_db_path: str = "logs/trades.db"
+    storage_parquet_root: str = "data/parquet"
+    storage_archive_root: str = "archive/parquet"
+    storage_keep_days: int = 30  # keep only last 30d locally, archive older
+    storage_gzipped_archive: bool = True  # also gzip for external drive
+    storage_min_notional: float = 200.0  # floor for 1k equity (20% => $200)
+
+    # --- Learner: Hybrid (RL Q-table + XGBoost veto) nightly retrain ---
+    learner_enabled: bool = True
+    learner_veto_threshold: float = 0.52  # win_prob < 0.52 => veto
+    learner_retrain_hour: int = 22  # 22:00 ET after close
+    learner_min_trades: int = 50  # need 50 trades to train
+    learner_model_dir: str = "models"
+
+    # --- Scanner: Open universe auto-rotation ---
+    scanner_enabled: bool = True
+    scanner_watchlist: list[str] | None = None  # None => DEFAULT_WATCHLIST (500 liquid)
+    scanner_top_n: int = 5  # how many symbols to hold
+    scanner_min_volume: int = 500000
+    scanner_approval_required: bool = True  # ask via Telegram before rotating
+    scanner_rank_cron_hour: int = 7  # 07:00 ET pre-market scan
+
     @classmethod
     def load(cls, config_path: Path) -> "BotConfig":
         logger = logging.getLogger("trend_bot")

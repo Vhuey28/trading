@@ -140,5 +140,25 @@
   "regime_qqq_sma_21": 21,
 
   "require_confirmed_breakout": true,
-  "telegram_enabled": true
+  "telegram_enabled": true,
+
+  "storage_db_path": "logs/trades.db",
+  "storage_parquet_root": "data/parquet",
+  "storage_archive_root": "archive/parquet",
+  "storage_keep_days": 30,
+  "storage_gzipped_archive": true,
+  "storage_min_notional": 200.0,
+
+  "learner_enabled": true,
+  "learner_veto_threshold": 0.52,
+  "learner_retrain_hour": 22,
+  "learner_min_trades": 50,
+  "learner_model_dir": "models",
+
+  "scanner_enabled": true,
+  "scanner_watchlist": null,
+  "scanner_top_n": 5,
+  "scanner_min_volume": 500000,
+  "scanner_approval_required": true,
+  "scanner_rank_cron_hour": 7
 }

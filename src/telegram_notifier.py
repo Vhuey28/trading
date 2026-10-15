@@ -60,7 +60,11 @@ class TelegramNotifier:
                     return False
                 return True
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                raw = exc.read()
+                detail = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+            except:
+                detail = str(exc)
             self.logger.warning("Telegram sendMessage HTTP %s: %s", exc.code, detail)
             return False
         except (urllib.error.URLError, TimeoutError) as exc:
@@ -69,6 +73,76 @@ class TelegramNotifier:
         except Exception as exc:  # noqa: BLE001 — notifications must never raise
             self.logger.warning("Unexpected error sending Telegram notification: %s", exc)
             return False
+
+    def send_message(self, text: str) -> bool:
+        return self._send(text)
+
+    def poll_approvals(self, pending_path) -> bool:
+        """
+        Poll Telegram getUpdates for /approve or /reject commands for scanner rotations.
+        Writes status to pending_path JSON if found.
+        Requires bot_token/chat_id.
+        """
+        if not self.enabled:
+            return False
+        try:
+            url = f"{self.API_ROOT}/bot{self.bot_token}/getUpdates?timeout=5"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+                import json
+                data = json.loads(raw)
+                results = data.get("result", [])
+                for upd in reversed(results[-10:]):  # check last 10
+                    msg = upd.get("message", {})
+                    if str(msg.get("chat", {}).get("id")) != str(self.chat_id):
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    lower = text.lower()
+                    if lower.startswith("/approve"):
+                        parts = text.split()
+                        sym = parts[1].upper() if len(parts) > 1 else ""
+                        # update pending file to approved
+                        from pathlib import Path
+                        p = Path(pending_path)
+                        if p.exists():
+                            import json as js
+                            cur = js.loads(p.read_text())
+                            proposal_add = cur.get("proposal", {}).get("add", {}).get("symbol", "")
+                            # if sym specified, must match; else approve whatever pending
+                            if not sym or sym == proposal_add:
+                                cur["status"] = "approved"
+                                if sym:
+                                    cur["approved_symbol"] = sym
+                                p.write_text(js.dumps(cur, indent=2))
+                                self._send(f"✅ Approved rotation to `{sym or proposal_add}` — will apply next scan.")
+                                # ack update
+                                self._ack_update(upd["update_id"])
+                                return True
+                    elif lower.startswith("/reject"):
+                        from pathlib import Path
+                        p = Path(pending_path)
+                        if p.exists():
+                            import json as js
+                            cur = js.loads(p.read_text())
+                            cur["status"] = "rejected"
+                            p.write_text(js.dumps(cur, indent=2))
+                            self._send("❌ Rotation rejected — keeping current symbols.")
+                            self._ack_update(upd["update_id"])
+                            return True
+                return False
+        except Exception as e:
+            self.logger.debug("Telegram poll_approvals failed: %s", e)
+            return False
+
+    def _ack_update(self, update_id: int):
+        try:
+            url = f"{self.API_ROOT}/bot{self.bot_token}/getUpdates?offset={int(update_id)+1}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except:
+            pass
 
     # ── public events ────────────────────────────────────────────────────
 
